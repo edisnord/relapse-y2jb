@@ -1,0 +1,41 @@
+MIT License
+
+Copyright (c) 2026 relapse-y2jb contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+This port redistributes no upstream code as a binary. `relapse.js` embeds:
+
+* the kernel stage from [ntfargo/Relapse-Exploit](https://github.com/ntfargo/Relapse-Exploit)
+  (`src/relapse_exploit.js`, MIT, Copyright (c) 2026 Nathan Fargo), copied
+  verbatim except for four marked edits - see README.md;
+* the per-firmware kernel offset tables (`window.KRW`) from the same
+  repository's `offsets/*.js` (MIT).
+
+It runs on top of [Gezine/Y2JB](https://github.com/Gezine/Y2JB) (MIT,
+Copyright (c) 2025 Gezine) and hands the finished jailbreak to Y2JB's bundled
+`kexp` shellcode (ufm42) and `elfldr` (john-tornblom / EchoStretch), which are
+part of the Y2JB framework and are not redistributed here.
+
+The `thr_new` ROP-worker technique follows the approach used by shahrilnet's
+`remote_lua_loader`, by Y2JB's own `lapse.js` (AGPL-3.0, derived from psfree)
+and by the p2jb Y2JB port; no code is copied from any of them, and this port's
+trampoline (`pop rsp; ret`) does not use their libc `longjmp` path.
