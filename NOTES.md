@@ -134,8 +134,12 @@ structure.
 
 ### Workaround
 
-Use rest mode. It suspends the app but keeps the process and the kernel alive,
-so `elfldr` and everything loaded through it keep running. Reboot when finished.
+Use rest mode instead of closing the app. Suspension does not exit the process,
+so the teardown path that panics never runs, and `elfldr` and everything loaded
+through it are still there when the console wakes. This is reasoned from how
+suspension works rather than verified on hardware — nothing executes while the
+console is in rest mode, so 9021 will not answer until you wake it. Reboot when
+finished.
 
 ## Debug build
 
