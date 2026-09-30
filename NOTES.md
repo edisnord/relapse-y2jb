@@ -80,64 +80,74 @@ The browser flow only *looks* immune. Pressing the PS button closes the browser
 **window** while the process stays resident, so the kernel's exit path never
 runs. Closing an app really does exit the process, and that is where it dies.
 
-### What was ruled out on hardware
+### What hardware testing established
 
-One reboot per row, each a separate build of the same payload:
+The trigger is **the pipe crossing** — `crossPipes()`, which is what creates the
+fast kernel read/write primitive. One run did the entire aio race (the sysctl OID
+hijack, the reclaim, the parked workers) and stopped before crossing: it survived
+the close. The same payload with the crossing added panics. Neither run had the
+kexp prep, the blob, the handoff or the escalation.
 
-| Run | kexp blob + elfldr | pipes | escalate | close YouTube |
-|-----|--------------------|-------|----------|---------------|
-| chain self-test only, exploit never starts | no | no | no | **survived** |
-| aio race + crossed pipes | no | left armed | no | died |
-| aio race + all 4 pipe fds closed by the payload (`close()` → 0) | no | freed early | yes | died |
-| aio race, both pipe buffers NULL and readback-verified | yes | disarmed | yes | died |
-| full run, `eboot` descriptors restored and verified | yes | upstream | yes | died |
+What that leaves is a mechanism nobody has observed yet. Everything the exploit
+writes into the two `struct pipe`s is irrelevant to it: a cleanup ELF with kernel
+read/write of its own nulled both buffers, all eight head fields and the
+direct-write pair, verified every readback, and the close still panicked. So the
+residue is outside the structs — the global `pipe_map` VM map, the two original
+buffers the crossing leaks, the KVA accounting — or the fault is not in the pipe
+teardown at all.
 
-Also cleared individually:
+Exonerated on hardware, one reboot per row:
 
-* **The pipes.** Both buffers NULL and verified by reading them back; and
-  separately, all four fds closed by the payload with every `close()` returning
-  0 and the console living through it. Freeing a pipe whose buffer points at
-  another pipe struct is harmless — `vm_map_remove()` on a range that was never
-  in `pipe_map` is the no-op it looks like.
-* **The payload.** A run with the blob and `elfldr` skipped entirely still died.
-* **`pldmgr`.** A run with nothing loaded at all still died.
-* **The sysctl OIDs.** Restored in upstream's order and verified by reading
-  `kern.smp.cpus` back. An earlier revision restored them *after* the pipe
-  teardown, which silently no-op'd the restore — `restoreOids()` writes through
-  the crossed pipes, and disarming them is what destroys that path. Both
-  primitives are single-use, so "both pipe buffers NULL *and* a clean sysctl
-  tree" is not reachable in any order. Upstream's order is the one that works.
-* **The widened `eboot` segments.** `segments[0]` is set to `addr=0, size=~0` so
-  the blob can resolve its imports; hardware showed the real descriptor is
-  `addr 0x5cc3c000, size 0x4000`, and the payload now writes it back and
-  verifies the readback before finishing.
-* **`fhold`** on the four pipe files, and **cred lifetime** — migrating every
-  `f_cred` and `td_ucred` onto the process cred the way the p2jb port does found
-  exactly one reference to move, and the close still panicked.
-* **The `thr_new`/ROP worker chain** this port adds. The one surviving run is
-  the one that exercised it and then never started the exploit.
+* **The aio race on its own**, including every fake waiter node. All three
+  reclaimed arrays were located, zeroed and read back as zero, and all 54 armed
+  groups confirmed clear by two independent paths.
+* **The sysctl OIDs**, restored in upstream's order or deliberately left hijacked.
+* **Graceful close versus `SIGKILL`.** Identical; the process exit is what kills it.
+* **The blob, `elfldr`, `pldmgr`**, the widened `eboot` segments, `fhold` on the
+  pipe files, cred migration, and this port's `thr_new`/ROP worker chain.
+* **`pipe_buffer.buffer` and `vm_map_remove()`.** An earlier revision stated that
+  nulling the buffer makes the exit path's removal a no-op. It does null it, and
+  it does not help.
 
-### What is left
+Two cleanups are themselves fatal and must not be enabled:
 
-The aio race, and specifically the slab memory it poisons. The exploit reclaims
-a freed aio waiter array with fake nodes containing `firstTarget`,
-`secondTarget` and a real kernel mutex pointer. Clearing the waiters list —
-which the payload does — stops the kernel walking them, but the array goes back
-to the allocator still holding those bytes, and whatever is allocated there next
-inherits them. Process exit recycles and frees a great deal of that memory,
-which is what an immediate black screen looks like.
+* Nulling `p_aioinfo` to "leak" the aio state — spontaneous panic, seconds after
+  the write, with the app still open.
+* Restoring the OIDs through the slow window *after* the pipes are disarmed.
+  `restoreOidsSlow()` restores the window through the window, and `aimWindow()`
+  steers by moving `arg1` pointers, so restoring `a.arg1` destroys the mechanism
+  the next write needs.
 
-Note that `p->p_aioinfo` is already NULL by the time the run finishes: the
-kernel's own cleanup frees it once the job count drops to zero. So there is no
-aio info left to detach, and the residue is in freed slab, not in a live
-structure.
+### Corrections to an earlier revision of this note
+
+Worth recording, because both were believed and acted on.
+
+* **"`p_aioinfo` is already NULL by the time the run finishes, so there is nothing
+  to detach."** False. The diagnostics used `readKernelPointer()`, which is the
+  slow sysctl-OID path, and every forensic call ran after `restoreOids()` had
+  closed it. A dead slow path returns null instead of throwing, and the callers
+  read that as an answer. `p_aioinfo` is live at teardown.
+* **"The residue is the poisoned slab the race leaves behind."** False, and it
+  followed from the first error plus misreading `dumpAioState()`, which took
+  `num`/`state`/`waiters` off the group object instead of the shared struct one
+  indirection further (`group+0x10`) and so reported request ids as states. The
+  poison was then located and scrubbed directly, and scrubbing it changed nothing.
 
 ### Workaround
 
 There is no workaround, and none is needed: leave the app open, and if you do
-close it, reboot and send the payload again. The run takes about three seconds,
-so rebooting costs less than anything that would have to be built to survive the
-exit path.
+close it, reboot and send the payload again. The run takes about three seconds, so
+rebooting costs less than anything that would have to be built to survive the exit
+path.
+
+Suspending the console is not a workaround either, and it was withdrawn from this
+note before it was ever tested. Nothing executes while the system is suspended, so
+`elfldr` would not answer on 9021 and a saved state would have nothing to resume
+into. Reboot.
+
+The full log — every build, every result, the flags, and the next experiments — is
+`docs/close-panic-investigation.md` in
+[Relapse-Y2JB-Porting](https://github.com/edisnord/Relapse-Y2JB-Porting).
 
 ## Debug build
 
