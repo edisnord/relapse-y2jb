@@ -40,10 +40,8 @@ mirrored to UDP port 5050 on your machine.
 ## Known limitation
 
 **Do not close the YouTube app after jailbreaking.** Exiting the process panics
-the console — immediate black screen. Use rest mode instead of closing it:
-suspension never runs the exit path, so the jailbreak survives and 9021 comes
-back when you wake the console. (Reasoned, not yet verified on hardware.) Reboot
-when you are done.
+the console — immediate black screen. Leave the app open. If you do close it,
+reboot and send the payload again — the whole run takes about three seconds.
 
 This is not specific to the port and the payload's own cleanup does not prevent
 it. [NOTES.md](NOTES.md) has the hardware investigation that ruled out

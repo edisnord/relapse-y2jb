@@ -134,12 +134,10 @@ structure.
 
 ### Workaround
 
-Use rest mode instead of closing the app. Suspension does not exit the process,
-so the teardown path that panics never runs, and `elfldr` and everything loaded
-through it are still there when the console wakes. This is reasoned from how
-suspension works rather than verified on hardware — nothing executes while the
-console is in rest mode, so 9021 will not answer until you wake it. Reboot when
-finished.
+There is no workaround, and none is needed: leave the app open, and if you do
+close it, reboot and send the payload again. The run takes about three seconds,
+so rebooting costs less than anything that would have to be built to survive the
+exit path.
 
 ## Debug build
 
