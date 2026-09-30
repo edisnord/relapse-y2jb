@@ -49,16 +49,19 @@ everything else.
 
 ## Credits
 
-* [Relapse](https://github.com/ntfargo/Relapse-Exploit) — ntfargo and the
-  authors it credits: the exploit, the offset tables and the kernel stage this
-  port runs verbatim.
-* [Y2JB](https://github.com/Gezine/Y2JB) — Gezine: the host, the loader, and the
-  `kexp`/`elfldr` files this hands the kernel to.
-* [kexp](https://github.com/ufm42/kexp) — ufm42.
-* [p2jb / Luac0re](https://github.com/Gezine/Luac0re) — Gezine, cheburek3000,
-  and [matem6's Y2JB port](https://github.com/matem6/P2JB-Y2JB-Porting) of it.
+This is a port; nothing here is original work.
 
-Full credit lists are relayed in [NOTES.md](NOTES.md).
+* [Relapse](https://github.com/ntfargo/Relapse-Exploit) — the exploit, the
+  offset tables and the kernel stage, used verbatim.
+* [Y2JB](https://github.com/Gezine/Y2JB) — the host, the loader, and the
+  `kexp`/`elfldr` files this hands the kernel to.
+* [kexp](https://github.com/ufm42/kexp) — the post-jailbreak shellcode.
+* [Luac0re / p2jb](https://github.com/Gezine/Luac0re) and
+  [P2JB-Y2JB-Porting](https://github.com/matem6/P2JB-Y2JB-Porting) — where the
+  `fhold`/`eboot` preparation, the one-run-per-boot marker and the post-jailbreak
+  cred handling come from.
+
+Each of those credits the people behind it in its own README.
 
 ## Licence
 

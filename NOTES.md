@@ -179,33 +179,27 @@ which is what keeps the payload under the loader's size limit.
 
 ## Credits
 
-Nothing here is original work; this is a port.
+Nothing here is original work; this is a port. Each project below keeps its own
+author list in its README, which is the authoritative one.
 
 **[Relapse](https://github.com/ntfargo/Relapse-Exploit)** — the browser stage,
 the `aio_multi_wait` UAF kernel stage and all 33 offset tables, used verbatim.
-Its own credits: ntfargo, ufm42, Sonic_Iso, Jordy, Dr. Yenyen, TheFlow,
-SlidyBat, Flatz, cow, nhk, bollarz, Sleirsgoevy, EchoStretch, EarthOnion.
 
-**[Y2JB](https://github.com/Gezine/Y2JB)** — Gezine. The host this runs inside,
-plus the loader, the sandbox slot layout and the `kexp`/`elfldr` files it ships.
-Its own credits: shahrilnet and null_ptr
-([Remote Lua Loader](https://github.com/shahrilnet/remote_lua_loader)),
-BenNoxXD ([ClosePlayer](https://github.com/BenNoxXD/PS5-BDJ-HEN-loader)),
-ntfargo (V8 CVEs and CTF writeups), abc and the psfree team (the lapse
-implementation), flat_z and LightningMods (GPU r/w via direct ioctl),
-john-tornblom and EchoStretch (`elfldr.elf`), hammer-83 (BD-J PS5 references),
-zecoxao, idlesauce and TheFlow (dlsym troubleshooting), Dr.Yenyen and the PS5
-R&D community (testing), Rush (the Y2JB backup file), ufm42 (`kexp`).
+**[Y2JB](https://github.com/Gezine/Y2JB)** — the host this runs inside: the
+remote JS loader and its payload protocol, the sandbox slot layout, and the
+`kexp` and `elfldr` files it ships. Its README also credits the projects it
+draws on, among them
+[Remote Lua Loader](https://github.com/shahrilnet/remote_lua_loader) and
+[ClosePlayer](https://github.com/BenNoxXD/PS5-BDJ-HEN-loader).
 
-**[kexp](https://github.com/ufm42/kexp)** — ufm42. The post-jailbreak
-all-in-one shellcode this port hands the kernel to.
+**[kexp](https://github.com/ufm42/kexp)** — the post-jailbreak all-in-one
+shellcode this port hands the kernel to. `elfldr` arrives bundled with Y2JB and
+is credited in its README.
 
-**[Luac0re / p2jb](https://github.com/Gezine/Luac0re)** — Gezine and
-cheburek3000, and **[matem6's Y2JB port of
-it](https://github.com/matem6/P2JB-Y2JB-Porting)**. The `fhold`/`eboot`
-preparation, the one-run-per-boot marker discipline and the post-jailbreak cred
-migration all come from that port's close-panic work, as does the observation
-that a jailbroken host process cannot be closed.
-
-**[Remote Lua Loader](https://github.com/shahrilnet/remote_lua_loader)** —
-shahrilnet, whose loader design Y2JB's payload protocol follows.
+**[Luac0re / p2jb](https://github.com/Gezine/Luac0re)** and
+**[P2JB-Y2JB-Porting](https://github.com/matem6/P2JB-Y2JB-Porting)** — the
+`fhold`/`eboot` preparation, the one-run-per-boot marker discipline and the
+post-jailbreak cred migration in the debug build all come from that port's
+close-panic work, as does the observation that a jailbroken host process cannot
+be closed. Its README credits the contributors behind that investigation,
+including the people who ran its hardware test builds.
