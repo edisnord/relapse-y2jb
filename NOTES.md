@@ -146,8 +146,9 @@ note before it was ever tested. Nothing executes while the system is suspended, 
 into. Reboot.
 
 The full log — every build, every result, the flags, and the next experiments — is
-`docs/close-panic-investigation.md` in
-[Relapse-Y2JB-Porting](https://github.com/edisnord/Relapse-Y2JB-Porting).
+`docs/close-panic-investigation.md` in `Relapse-Y2JB-Porting`, the source tree
+this payload is built from. That repository is not published; ask for the log if
+you are resuming the work.
 
 ## Debug build
 

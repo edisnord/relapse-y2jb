@@ -43,9 +43,13 @@ mirrored to UDP port 5050 on your machine.
 the console — immediate black screen. Leave the app open. If you do close it,
 reboot and send the payload again — the whole run takes about three seconds.
 
-This is not specific to the port and the payload's own cleanup does not prevent
-it. [NOTES.md](NOTES.md) has the hardware investigation that ruled out
-everything else.
+This is not specific to the port. Hardware bisecting puts the trigger on the
+pipe crossing that creates the exploit's fast kernel read/write primitive — a
+run that does the whole aio race and stops before crossing survives the close,
+and one that crosses does not. Neither the payload's own cleanup nor a cleanup
+ELF with kernel read/write of its own prevents it.
+[NOTES.md](NOTES.md) has what was established, what was exonerated, and two
+earlier conclusions that turned out to be instrumentation artifacts.
 
 ## Credits
 
