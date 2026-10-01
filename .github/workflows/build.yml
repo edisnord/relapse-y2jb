@@ -6,6 +6,12 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release for this existing tag (blank = build only)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -15,11 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # The upstream kernel stage and the 33 offset tables come from the pinned
-      # submodule, so the build is reproducible from a tag alone.
+      # submodule, so the build is reproducible from a tag alone. A dispatch can
+      # name an existing tag: the workflow file then comes from the dispatching
+      # branch while the source tree comes from the tag, so a failed release can
+      # be re-published without moving the tag and the artifact's provenance
+      # still matches the tag it is published under.
       - name: Check out with submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -27,7 +38,7 @@ jobs:
 
       - name: Record what this artifact was built from
         run: |
-          echo "relapse-y2jb:           $(git rev-parse HEAD)"
+          echo "relapse-y2jb:             $(git rev-parse HEAD)"
           echo "upstream Relapse-Exploit: $(git -C third_party/Relapse-Exploit rev-parse HEAD)"
 
       - name: Build the y2jb target
@@ -86,12 +97,27 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Fires on a v* tag push, or on a dispatch that names an existing tag.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.release_tag != '')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # gh release create --generate-notes reads git history to build the
+      # changelog, so this job needs a real checkout and not just the artifact.
+      # Full history and tags, or it cannot find the previous release to diff
+      # against.
+      - name: Check out for release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
       - uses: actions/download-artifact@v4
         with:
           name: relapse-js
@@ -99,8 +125,11 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          echo "publishing release for $TAG"
+          sha256sum -c relapse.js.sha256
+          gh release create "$TAG" \
             relapse.js relapse.js.sha256 \
-            --title "relapse-y2jb $GITHUB_REF_NAME" \
+            --title "relapse-y2jb $TAG" \
             --generate-notes
