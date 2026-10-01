@@ -1,2 +1,5 @@
 *.swp
 *.log
+/relapse.js
+/relapse.js.sha256
+/relapse-*.js

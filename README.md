@@ -3,8 +3,9 @@
 The [Relapse](https://github.com/ntfargo/Relapse-Exploit) PS5 kernel exploit
 (`aio_multi_wait` use-after-free), ported from the WebKit browser host to
 [Y2JB](https://github.com/Gezine/Y2JB) — the YouTube TV app modded to run
-payloads. Launch YouTube, send `relapse.js`, get a jailbreak and an ELF loader
-on port 9021. No browser, no DNS blocker, no user-guide redirect.
+payloads — by **edisnord**. Launch YouTube, send `relapse.js`, get a jailbreak
+and an ELF loader on port 9021. No browser, no DNS blocker, no user-guide
+redirect.
 
 ## Requirements
 
@@ -18,7 +19,12 @@ README says a behaviour is safe, it means it was measured there.
 
 ## Usage
 
-Send it like any other Y2JB payload:
+Download `relapse.js` from the
+[releases page](https://github.com/edisnord/relapse-y2jb/releases) — it is built
+by CI rather than kept in the repository, so what you download is reproducible
+from the tag it was built from. `relapse.js.sha256` is attached alongside it.
+
+Then send it like any other Y2JB payload:
 
 ```bash
 python payload_sender.py <ps5-ip> relapse.js
@@ -71,6 +77,16 @@ The exploit's fast kernel read/write works by pointing one pipe's buffer at the
 other pipe's struct; if the process exits in that state the kernel's pipe teardown
 frees memory it should not. [NOTES.md](NOTES.md) has the two causes, how they were
 found, and why the obvious cleanup makes this worse rather than better.
+
+## Building from source
+
+`relapse.js` is generated — do not edit it. CI builds it from
+`src/relapse.template.js` plus the upstream kernel stage and offset tables, which
+are vendored as a pinned submodule, and publishes it to the releases page.
+
+See **[BUILD.md](BUILD.md)** for the inputs, the two targets (`y2jb` and
+`autoloader`) and what differs between them, the build flags, how to validate a
+build, and how to reproduce a published artifact byte for byte.
 
 ## Credits
 

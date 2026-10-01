@@ -1,0 +1,106 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # The upstream kernel stage and the 33 offset tables come from the pinned
+      # submodule, so the build is reproducible from a tag alone.
+      - name: Check out with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Record what this artifact was built from
+        run: |
+          echo "relapse-y2jb:           $(git rev-parse HEAD)"
+          echo "upstream Relapse-Exploit: $(git -C third_party/Relapse-Exploit rev-parse HEAD)"
+
+      - name: Build the y2jb target
+        run: node tools/build.mjs --out relapse.js
+
+      - name: Syntax check
+        run: node --check relapse.js
+
+      # A payload over this size is truncated mid-parse by the loader and the
+      # console reports "SyntaxError: Unexpected end of input", which reads like
+      # a bug in the payload. Fail here instead of shipping something unloadable.
+      - name: Size gate (loader limit 0x40000)
+        run: |
+          size=$(wc -c < relapse.js)
+          limit=262144
+          echo "relapse.js is $size bytes; limit $limit; headroom $((limit - size))"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::relapse.js is $size bytes, over the $limit-byte Y2JB loader limit - it would be truncated and would not run."
+            exit 1
+          fi
+
+      - name: Reproducibility check
+        run: |
+          node tools/build.mjs --out /tmp/again.js >/dev/null
+          cmp relapse.js /tmp/again.js
+          echo "two consecutive builds are byte-identical"
+
+      # hostcheck runs the payload against a fake Y2JB host in a node:vm context.
+      # It does not emulate the kernel, so the exploit cannot succeed here; it
+      # verifies the host/adapter logic, the offset tables and the logging paths.
+      - name: Hostcheck
+        run: |
+          for fw in 7.61 11.60 12.60 13.60; do
+            echo "=== hostcheck $fw ==="
+            node tools/hostcheck.mjs "$fw"
+          done
+
+      # Built so a change to the shared template cannot silently break the
+      # autoloader entry point. Not published - that project vendors its own copy.
+      - name: Build the autoloader target (verification only)
+        run: |
+          node tools/build.mjs --target autoloader --out /tmp/autoloader.js
+          node --check /tmp/autoloader.js
+
+      - name: Checksum
+        run: |
+          sha256sum relapse.js > relapse.js.sha256
+          cat relapse.js.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relapse-js
+          path: |
+            relapse.js
+            relapse.js.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: relapse-js
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            relapse.js relapse.js.sha256 \
+            --title "relapse-y2jb $GITHUB_REF_NAME" \
+            --generate-notes
