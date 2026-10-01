@@ -59,6 +59,11 @@ UDP copy is the one that survives a kernel panic, so it is worth capturing:
 nc -u -l 5050
 ```
 
+If the mirror cannot be set up the payload says why rather than just reporting that
+it is off. The common case is sending the payload from the console itself, through a
+payload manager: the peer is then loopback and there is nowhere to mirror to, so send
+it from a PC on the same network if you want the panic-surviving copy.
+
 A normal run is about thirty lines: the KASLR base, slow and then fast kernel
 read/write, the aio group check, privileges, two preparation lines, the blob and
 `elfldr` delivery steps `1/6` through `7`, the shellcode's return value, `:9021`

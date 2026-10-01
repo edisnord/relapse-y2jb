@@ -63,6 +63,7 @@
         let net_log_target = "";
         let net_log_failures = 0;
         let net_log_error = "";
+        let net_log_reason = "";
         function drain(num, fd, n, to) {
             let sent = 0;
             while (sent < n) {
@@ -82,22 +83,44 @@
                 if (NET_LOG === "off") return false;
                 let ip;
                 if (NET_LOG === "auto") {
-                    if (socket_log_fd === null) return false;
+                    if (socket_log_fd === null) {
+                        net_log_reason = "the loader's log socket was not in scope, " +
+                            "so there is no peer to ask";
+                        return false;
+                    }
                     const sa = hmalloc(16);
                     const len = hmalloc(8);
                     write64(sa, 0n); write64(sa + 8n, 0n); write64(len, 16n);
-                    if (syscall(SYSCALL.getpeername, socket_log_fd, sa, len) === MASK64)
+                    if (syscall(SYSCALL.getpeername, socket_log_fd, sa, len) === MASK64) {
+                        net_log_reason = "getpeername() on the loader socket failed";
                         return false;
+                    }
                     ip = [Number(read8(sa + 4n) & 0xffn), Number(read8(sa + 5n) & 0xffn),
                         Number(read8(sa + 6n) & 0xffn), Number(read8(sa + 7n) & 0xffn)];
-                    if (ip[0] === 0 || ip[0] === 127) return false;
+                    if (ip[0] === 127) {
+                        net_log_reason = "the payload came from the console itself " +
+                            "(peer is loopback), so there is nowhere to mirror to - " +
+                            "send it from the PC, or set NET_LOG to an address";
+                        return false;
+                    }
+                    if (ip[0] === 0) {
+                        net_log_reason = "the loader socket's peer address is 0.0.0.0";
+                        return false;
+                    }
                 } else {
                     ip = String(NET_LOG).split(".").map(Number);
-                    if (ip.length !== 4 || ip.some((o) => !(o >= 0 && o <= 255))) return false;
+                    if (ip.length !== 4 || ip.some((o) => !(o >= 0 && o <= 255))) {
+                        net_log_reason = "NET_LOG is not \"off\", \"auto\" or a dotted " +
+                            "address: " + NET_LOG;
+                        return false;
+                    }
                 }
                 const fd = syscall(SYSCALL.socket, 2n /* AF_INET */,
                     2n /* SOCK_DGRAM */, 0n);
-                if (fd === MASK64) return false;
+                if (fd === MASK64) {
+                    net_log_reason = "socket(SOCK_DGRAM) failed";
+                    return false;
+                }
                 const sa = hmalloc(16);
                 for (let i = 0n; i < 16n; i += 1n) write8(sa + i, 0n);
                 write8(sa + 1n, 2n /* AF_INET */);
@@ -5473,11 +5496,16 @@
               const wz = await this.writeKernel64(seg.add32(0x10),
                 this.ebootOrig.size.low, this.ebootOrig.size.hi);
               const back = await this.readKernel64(seg.add32(0x10));
+              const backAddr = await this.readKernel64(seg.add32(0x08));
               const same = back.low === this.ebootOrig.size.low &&
-                back.hi === this.ebootOrig.size.hi;
+                back.hi === this.ebootOrig.size.hi &&
+                backAddr.low === this.ebootOrig.addr.low &&
+                backAddr.hi === this.ebootOrig.addr.hi;
               this.ebootRestored = same;
-              this.report("kexp", "eboot segments restored to addr 0x" +
-                this.ebootOrig.addr.toString() + " size 0x" + back.toString() + " (" +
+              this.report("kexp", "eboot segments restored: addr reads back 0x" +
+                backAddr.toString() + " (want 0x" + this.ebootOrig.addr.toString() +
+                "), size 0x" + back.toString() + " (want 0x" +
+                this.ebootOrig.size.toString() + ") (" +
                 (wa && wz && same ? "verified" : "MISMATCH") + ")");
             }
             return true;
@@ -5968,9 +5996,9 @@
           }
           async restorePipes() {
             if (typeof LEAVE_PIPES_ARMED !== "undefined" && LEAVE_PIPES_ARMED) {
-              this.report("pipes", "LEAVE_PIPES_ARMED: the pair stays crossed so elfldr keeps " +
-                "kernel r/w. Send tools/pipeclean/pipeclean.elf to :9021 BEFORE closing the " +
-                "app - closing with the pipes still armed panics the console.");
+              this.report("pipes", "the pair is left crossed on purpose so elfldr keeps kernel " +
+                "r/w. Send the pipeclean seal ELF to :9021 BEFORE closing the app - closing " +
+                "with the pipes still armed panics the console.");
               return;
             }
             if (this.disarmed) return;
@@ -6150,9 +6178,10 @@
             log_now("network log: every line also goes to " + net_log_target +
                 " (tools/log_listener.py)");
         else if (NET_LOG !== "off")
-            log_now("network log disabled" +
-                (net_log_error ? " (" + net_log_error + ")" :
-                    " (no payload_sender peer address)"));
+            log_now("network log disabled: " +
+                (net_log_error || net_log_reason || "unknown reason") +
+                ". Without UDP the only transcript is the loader's TCP stream, " +
+                "which reorders and loses lines when the console dies");
         send_notification(relapse_version + "\nFW " + FW_VERSION + "\n" +
             (typeof version_string === "string" ? version_string : "Y2JB"));
         say("relapse-y2jb starting");
@@ -6290,31 +6319,8 @@
                     victim: exploit.victim ? [exploit.victim.readFd, exploit.victim.writeFd] : null,
                 };
             };
-            globalThis.relapse_seal_pipes = async function () {
-                const st = globalThis.relapse_status();
-                await log("[relapse-seal] state before: crossed=" + st.crossed +
-                    " master=" + JSON.stringify(st.master) +
-                    " victim=" + JSON.stringify(st.victim));
-                if (!st.crossed) {
-                    await log("[relapse-seal] nothing to do - rescue() already tore the pipes down");
-                    return true;
-                }
-                let ok;
-                if (st.oidsRestored) {
-                    await exploit.restorePipes();
-                    ok = !exploit.crossed;
-                } else {
-                    ok = await exploit.disarmPipes();
-                }
-                const after = globalThis.relapse_status();
-                await log("[relapse-seal] state after: disarmed=" + after.disarmed +
-                    " crossed=" + after.crossed +
-                    (ok ? " - nothing left armed" : " - SEAL FAILED"));
-                return ok;
-            };
-            log_now("seal hook installed: send tools/seal.js before closing YouTube");
         } catch (e) {
-            log_now("could not install the seal hook: " + e.message);
+            log_now("could not install the status hook: " + e.message);
         }
         if (PIPE_NOTE_FOR_CLEANER && exploit.master && exploit.victim) {
             try {
@@ -6361,8 +6367,10 @@
             catch (e) { say("crash-artifact scan threw " + e.message); }
         }
         await log("[relapse] === relapse complete ===");
-        await log("[relapse] elfldr listening on :9021 (pipes and sysctl OIDs " +
-            "torn down, eboot segments restored - upstream rescue() state)");
+        await log("[relapse] elfldr listening on :9021" + (exploit.crossed
+            ? " - the crossed pair is STILL ARMED: send the pipeclean seal ELF to " +
+            ":9021 BEFORE closing the app, closing while armed panics the console"
+            : " (pipes and sysctl OIDs torn down, eboot segments restored)"));
         send_notification("relapse complete\nelfldr on <ps5-ip>:9021");
         if (EXIT_TEST === "sigkill" || EXIT_TEST === "exit") {
             const pid = syscall(SYSCALL.getpid);
