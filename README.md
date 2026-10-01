@@ -8,11 +8,13 @@ on port 9021. No browser, no DNS blocker, no user-guide redirect.
 
 ## Requirements
 
-* PS5 on firmware **7.00 – 13.60**
+* PS5 on firmware **7.00 – 13.60** — the range the offset tables cover, not a
+  range that has been tested
 * Y2JB **1.5 or newer**, restored and working
 * A PC on the same network
 
-Tested on firmware 12.60 with Y2JB 1.6 and YouTube app 01.000.030.
+Tested on firmware 12.60 with Y2JB 1.6 and YouTube app 01.000.030. Where this
+README says a behaviour is safe, it means it was measured there.
 
 ## Usage
 
@@ -45,8 +47,15 @@ Send the seal to port 9021, then close YouTube normally:
 nc <ps5-ip> 9021 < seal/pipeclean.elf
 ```
 
-The console survives. `:9021` and any payload manager you loaded keep serving
-afterwards, so payloads can be loaded on either side of the seal.
+On 12.60 the console survives, and `:9021` and any payload manager you loaded
+keep serving afterwards, so payloads can be loaded on either side of the seal.
+
+**That is measured on 12.60 only.** On a 7.61 console the seal reported success —
+both buffers written back and read back correct — and closing still panicked the
+kernel. The seal is necessary on every firmware and sufficient on the ones it has
+been tested on; elsewhere it may not be enough.
+[NOTES.md](NOTES.md#measured-on-1260-only) records what that log proves and what
+it cannot.
 
 The seal needs the pipe addresses the exploit used, and it reads them from a
 note file the payload writes — there is nothing to copy by hand. The payload's

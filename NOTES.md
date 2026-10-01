@@ -82,6 +82,44 @@ Closing YouTube after a jailbreak panics the console unless `seal/pipeclean.elf`
 has been sent to port 9021 first. This is what the seal does, and why the payload
 cannot do it itself.
 
+### Measured on 12.60 only
+
+Everything in this section was established on firmware 12.60. The seal is
+necessary on every firmware, because the state it fixes is the state the exploit
+leaves on every firmware. It is only *known* to be sufficient on 12.60.
+
+A 7.61 console (YouTube PPSA01651) ran the payload, sent the seal, got "both
+pipes are ordinary again, the app can exit", closed the app and kernel-panicked.
+That log pair is worth reading closely, because it separates "the seal failed"
+from "something else is left over" — and it says the seal did its job:
+
+* It ran in restore mode, and read both buffers back equal to what it wrote.
+* The 7.61 pipe offsets are correct independently of the offset table. The
+  never-written reference pipe shows `count`/`in`/`out` zero, `size` 0x4000 at
+  +0x0c and `buffer` NULL at +0x10 — exactly where the table puts them.
+* `restoreOids()` ran to completion. At seal time the victim's `buffer` was
+  `kbase + 0x3c93f78`, and `0x3c93f78` is that firmware's `walkCounter.addr`,
+  the target of the function's last write. Every fast-path write re-aims the
+  victim before it lands, so the leftover pointer fingerprints the last write
+  performed.
+* The pre-seal struct state matches the 12.60 state that survived closing, field
+  for field.
+
+So on 7.61 there is a third cause of the close panic, outside the two pipe
+structs and outside the sysctl OIDs. It has not been found. That particular
+report cannot narrow it any further: it was captured with network logging
+disabled, so there was no UDP stream, and the TCP-only transcript is lossy and
+out of order — it prints `kexp shellcode returned` before the `Thrd_create` that
+caused it. Two success lines are missing from it, but missing lines in these
+transcripts are normal rather than meaningful, because part of the payload logs
+through the framework's buffered `log()` and part through a synchronous
+`write(2)`.
+
+If closing panics your console on some other firmware, re-run with the payload
+sent over a raw TCP connection so it mirrors every line to UDP 5050. That
+transcript survives the panic and keeps its order, which is what it takes to tell
+a failed step from a lost log line.
+
 ### What the exploit leaves behind
 
 Fast kernel read/write is built from two pipes. One pipe's `buffer` field is
