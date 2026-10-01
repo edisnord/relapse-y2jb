@@ -14,14 +14,12 @@ the host app cannot be closed.
 3. Prepares the state Y2JB's kernel payload expects — widened `eboot` segment
    descriptors — then hands the crossed pipes and `allproc` to the `kexp` blob
    Y2JB already downloaded, which starts `elfldr`.
-4. Puts back what it can on the way out: the sysctl OIDs, the armed aio groups,
-   the parked aio workers, the scratch descriptors, and `eboot`'s original
-   segment descriptors. Teardown runs in upstream Relapse's order, which matters
-   — see below.
-5. Leaves the pipes crossed on purpose, because that is what `elfldr`'s kernel
-   read/write rides, and writes a note file recording the pipe addresses and the
-   buffers they had before the crossing. `seal/pipeclean.elf` reads that note and
-   puts the buffers back; see below for why closing without it panics.
+4. Puts back what it can on the way out: both pipes' own buffers and sizes, the
+   armed aio groups, the parked aio workers, the scratch descriptors, and `eboot`'s
+   original segment descriptors. Teardown order matters — see below.
+5. Leaves the sysctl OIDs hijacked, because the write window that restores the
+   pipes cannot close itself. That is the one residue a reboot clears; see
+   [Closing the app](#closing-the-app).
 
 Anything sent to port 9021 after that is loaded as an ELF.
 
@@ -64,6 +62,21 @@ it is off. The common case is sending the payload from the console itself, throu
 payload manager: the peer is then loopback and there is nowhere to mirror to, so send
 it from a PC on the same network if you want the panic-surviving copy.
 
+Every line is prefixed `[relapse NNN]` with a sequence number. The loader's TCP
+transcript reorders and drops lines when the console dies — one external report had
+`kexp shellcode returned` printed before the `Thrd_create` that caused it — and
+without a number there is no way to tell a lost line from a late one. With it, the
+highest number received is the last step completed and any gap names the step that
+died. Every line goes through the synchronous path; two of them used to go through
+the framework's buffered `log()` instead, and they were `=== relapse complete ===`
+and the final state line, which is why they were the ones missing from transcripts
+of runs that panicked.
+
+The last line states whether closing is safe rather than leaving it to inference,
+and the teardown summary is derived from what was actually achieved — pipes safe or
+possibly still armed, OIDs restored or left hijacked. Three earlier revisions
+printed success there without having checked.
+
 A normal run is about thirty lines: the KASLR base, slow and then fast kernel
 read/write, the aio group check, privileges, two preparation lines, the blob and
 `elfldr` delivery steps `1/6` through `7`, the shellcode's return value, `:9021`
@@ -83,20 +96,25 @@ that file clears it.
 
 ## Closing the app
 
-Closing YouTube after a jailbreak panics the console unless `seal/pipeclean.elf`
-has been sent to port 9021 first. This is what the seal does, and why the payload
-cannot do it itself.
+Closing YouTube after a jailbreak used to panic the console, and an earlier
+revision of this repository shipped an ELF to prevent it. The payload now does
+that work itself: it writes both pipes' own buffers and sizes back before it
+returns, verified by readback, and the app can be closed normally.
+
+What follows is why that is the fix, what it leaves behind, and the one firmware
+where it has been seen not to be enough.
 
 ### Measured on 12.60 only
 
-Everything in this section was established on firmware 12.60. The seal is
-necessary on every firmware, because the state it fixes is the state the exploit
-leaves on every firmware. It is only *known* to be sufficient on 12.60.
+Everything in this section was established on firmware 12.60. Restoring the pipe
+buffers is necessary on every firmware, because the state it fixes is the state the
+exploit leaves on every firmware. It is only *known* to be sufficient on 12.60.
 
-A 7.61 console (YouTube PPSA01651) ran the payload, sent the seal, got "both
-pipes are ordinary again, the app can exit", closed the app and kernel-panicked.
-That log pair is worth reading closely, because it separates "the seal failed"
-from "something else is left over" — and it says the seal did its job:
+A 7.61 console (YouTube PPSA01651) ran an earlier revision, sent the seal ELF, got
+"both pipes are ordinary again, the app can exit", closed the app and
+kernel-panicked. That log pair is worth reading closely, because it separates "the
+restore failed" from "something else is left over" — and it says the restore did
+its job:
 
 * It ran in restore mode, and read both buffers back equal to what it wrote.
 * The 7.61 pipe offsets are correct independently of the offset table. The
@@ -111,14 +129,18 @@ from "something else is left over" — and it says the seal did its job:
   for field.
 
 So on 7.61 there is a third cause of the close panic, outside the two pipe
-structs and outside the sysctl OIDs. It has not been found. That particular
-report cannot narrow it any further: it was captured with network logging
-disabled, so there was no UDP stream, and the TCP-only transcript is lossy and
-out of order — it prints `kexp shellcode returned` before the `Thrd_create` that
-caused it. Two success lines are missing from it, but missing lines in these
-transcripts are normal rather than meaningful, because part of the payload logs
-through the framework's buffered `log()` and part through a synchronous
-`write(2)`.
+structs and outside the sysctl OIDs. It has not been found, and because it is
+outside both, doing the restore from the payload rather than from an ELF would not
+have prevented it.
+
+That particular report cannot narrow it any further: it was captured with network
+logging disabled, so there was no UDP stream, and the TCP-only transcript is lossy
+and out of order — it prints `kexp shellcode returned` before the `Thrd_create`
+that caused it. Two of the payload's own lines went through the framework's
+buffered `log()` rather than the synchronous `write(2)` path, which is why they
+were missing; both now go through the synchronous path, and every line carries a
+sequence number, so a gap names the step that died instead of leaving it to
+guesswork. See [Logging](#logging).
 
 If closing panics your console on some other firmware, re-run with the payload
 sent over a raw TCP connection so it mirrors every line to UDP 5050. That
@@ -130,16 +152,21 @@ a failed step from a lost log line.
 Fast kernel read/write is built from two pipes. One pipe's `buffer` field is
 pointed at the other pipe's `struct pipe`, so a `write()` on the first lands in
 the second's fields; the second's `buffer` is then aimed at an arbitrary kernel
-address, so a `write()` on it lands anywhere. None of that is undone when the
-payload finishes, because `elfldr`'s kernel read/write is the same mechanism and
-has to keep working.
+address, so a `write()` on it lands anywhere.
 
-If the process exits in that state the kernel tears the pipes down. `pipe_dtor()`
+The payload undoes that before it returns. It was believed that it could not,
+because `kexp` is handed the same two pipe descriptor pairs and `elfldr`'s kernel
+access was assumed to ride on the crossing. It does not: `kexp` runs on its own
+`pipe2`, set up during the handoff before any teardown runs. An FTP server that
+cannot do its job without kernel write answered with its banner after a run that
+had already restored both pipes and closed the app.
+
+If the process exits while the pipes are still crossed the kernel tears them down. `pipe_dtor()`
 calls `pipe_free_kmem()`, which frees `pipe_buffer.buffer` for `pipe_buffer.size`
 bytes — so it hands `kmem_free()` another pipe's struct as though it were a 16 KB
 buffer allocation. That is the panic.
 
-### Why the seal restores the buffers rather than clearing them
+### Why it restores the buffers rather than clearing them
 
 Setting `buffer` to NULL looks like the fix and is not. A pipe that has been used
 and then had its buffer field cleared sits at `buffer = 0, size = 0`, which is not
@@ -148,26 +175,41 @@ orphans the real allocation while `amountpipekva` goes on counting it. With
 everything else held equal, clearing the buffers kills the console within three
 seconds of exit and restoring them does not.
 
-So the seal writes each pipe's own buffer and size back — recorded by the payload
-before the crossing overwrote them, and left in a note file the seal reads —
-zeroes `count`, `in` and `out`, and verifies every field by readback. What is left
-is an ordinary used-but-empty pipe, which the kernel frees normally.
+So the payload records both pipes' real buffer addresses before the crossing
+overwrites them, writes them back at teardown along with the size, zeroes `count`,
+`in` and `out`, and verifies every field by readback. What is left is an ordinary
+used-but-empty pipe, which the kernel frees normally.
 
 The allocation is a `pipepair`, not a single `struct pipe`: the second half sits at
 `+0x108` and `+0xe0` holds the peer pointer. Both halves matter.
 
-### Why the payload cannot seal itself
+### What the payload still cannot undo
 
-The restore goes through the sysctl-OID write window, the exploit's other
-primitive, and has to run while that window is still open. Restoring the OIDs
-closes it, and the window cannot restore its own writable `kind`, because that
-field is what makes it writable.
+The pipes are restored. The sysctl OIDs are not, and that is forced rather than a
+shortcut.
 
-Restoring the buffers through the pipes instead runs into a parity limit. Writing
-the first pipe's struct requires the second to be aimed at it, writing the second's
-requires the first to be aimed at it, and each aim overwrites the field being
-repaired — so one of the two is always left pointing at a struct. An ELF with its
-own kernel read/write has neither constraint, which is why the seal is a payload.
+The exploit has two kernel write primitives. The fast one works by aiming the
+victim pipe at a target and writing through it, and it exists only while the
+master's `buffer` points at the victim's struct — so the write that repairs the
+master is the write that destroys the primitive. The slow one goes through a
+hijacked sysctl node and never touches the pipes, so it survives any pipe state,
+but it exists only because three OID fields were modified: aiming goes through
+`kern.smp.cpus`, which needs its `arg1` hijacked and its `kind` writable, and
+landing goes through `kern.smp.maxcpus`, which needs its `kind` writable and the
+node visible. Restoring those fields needs a write through the window they enable,
+so the window cannot close itself.
+
+Hiding `kern.smp.maxcpus` first looked like the way out — the stock kernel does not
+expose it, so a wrong `kind` behind an unresolvable node would be harmless. It was
+measured and it does not work: a hidden node returns `rv -1` for read and write
+alike, with the same write succeeding immediately before and immediately after.
+
+So the payload repairs the pipes with the slow window and leaves the OIDs. The
+alternative — repairing the OIDs with the fast window — leaves one pipe armed, and
+that is the state that panics. An ELF with kernel read/write from a third source
+has neither constraint, which is why one used to ship; it is not needed, and it is
+not in this repository any more, because the note file it read is not written by
+this configuration.
 
 ### A mitigation that was removed
 
@@ -179,13 +221,14 @@ four `struct file` objects past process exit, which the teardown still has to
 account for. A full production run with the hold died four seconds after exit; the
 same run without it survived.
 
-### The seal does not interrupt anything
+### Closing the app does not interrupt anything
 
-`:9021` and any payload manager keep serving after the seal, and after the app
-exits. Payloads load on either side of it — checked with a DNS redirect, a mount
-helper and the homebrew enabler, which cannot do its job without writing kernel
-state. That kernel access survives the restore is measured; how it does is not,
-since the expectation was that it rode the crossed pipes and would die with them.
+`:9021` and any payload manager keep serving after the app exits. Payloads load on
+either side of the restore — checked with a DNS redirect, a mount helper, an FTP
+server and the homebrew enabler, none of which can do their jobs without writing
+kernel state. That kernel access survives is measured. It was expected not to, on
+the reasoning that it rode the crossed pipes; the reason it does is that `kexp`
+runs on its own `pipe2`.
 
 ### Two build flags that are fatal
 
@@ -199,8 +242,9 @@ that runs on a console you care about.
   steers by moving `arg1` pointers, so restoring `a.arg1` destroys the mechanism
   the next write needs.
 
-If the app is closed without sealing, reboot and send the payload again; the run
-takes about three seconds. Suspending the console is not an alternative — nothing
+If a run is interrupted before its teardown finishes, the pipes are still crossed
+and closing the app will panic; reboot and send the payload again, which takes
+about three seconds. Suspending the console is not an alternative — nothing
 executes while suspended, so `:9021` will not answer and a saved state has nothing
 to resume into.
 

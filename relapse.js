@@ -26,12 +26,12 @@
         const AIO_CANCEL_ALL = false;
         const EXIT_TEST = null;
         const SKIP_RELEASE_WORKERS = false;
-        const CLEAN_TEARDOWN = false;
-        const RESTORE_REAL_BUFFERS = false;
-        const LEAVE_PIPES_ARMED = true;
+        const CLEAN_TEARDOWN = true;
+        const RESTORE_REAL_BUFFERS = true;
+        const LEAVE_PIPES_ARMED = false;
         const PIPE_STRUCT_DIFF = false;
-        const PIPE_NOTE_FOR_CLEANER = true;
-        const SKIP_OID_RESTORE = false;
+        const PIPE_NOTE_FOR_CLEANER = false;
+        const SKIP_OID_RESTORE = true;
         const FHOLD_AT_RESCUE = false;
         const CRASH_ARTIFACT_SCAN = false;
         const DIAGNOSE_AFTER_HANDOFF = false;
@@ -138,8 +138,11 @@
                 return false;
             }
         }
+        let log_seq = 0;
         function log_now(msg) {
-            const text = "[relapse] " + msg;
+            log_seq++;
+            const seq = (log_seq < 10 ? "00" : log_seq < 100 ? "0" : "") + log_seq;
+            const text = "[relapse " + seq + "] " + msg;
             try {
                 const pr = log(text);           // on-screen (async, may lag)
                 if (pr && typeof pr.catch === "function") pr.catch(() => { });
@@ -5887,8 +5890,11 @@
             else await this.releaseAioWorkers();
             await sleep(200);
             await this.closeScratchDescriptors();
-            this.report("Cleanup", "clean teardown done: pipes disarmed, groups defused, " +
-              "oids restored, workers released, scratch fds closed");
+            this.report("Cleanup", "clean teardown done: pipes " +
+              (disarmed ? "safe (real buffers restored)" : "MAY STILL BE ARMED - closing can panic") +
+              ", groups defused, oids " +
+              (this.oidsRestored ? "restored" : "LEFT HIJACKED until reboot") +
+              ", workers released, scratch fds closed");
           }
           async fptr(address) {
             const v = await this.readKernel64(address);
@@ -6216,7 +6222,7 @@
             fatal("FW " + fw + " has no Relapse offset table. Bundled: " +
                 (picked.hint.length ? picked.hint.join(", ") +
                     " (this major version)" : picked.known.join(", ")));
-        await log("[relapse] FW " + fw + " offsets loaded (allproc rva " +
+        log_now("FW " + fw + " offsets loaded (allproc rva " +
             toHex(BigInt(off.allproc)) + ", aio uaf)");
         const marker_paths = ["/user/temp/common_temp/" + FAIL_MARKER_NAME];
         try {
@@ -6228,7 +6234,7 @@
                 try { return file_exists(m); } catch (_) { return false; }
             });
             if (present.length && IGNORE_FAIL_MARKER) {
-                await log("[relapse] fail marker present (" + present[0] +
+                log_now("fail marker present (" + present[0] +
                     ") but IGNORE_FAIL_MARKER is set - continuing anyway");
             } else if (present.length) {
                 send_notification("relapse already ran this boot\nreboot the PS5 first");
@@ -6366,11 +6372,15 @@
             try { scan_crash_artifacts(); }
             catch (e) { say("crash-artifact scan threw " + e.message); }
         }
-        await log("[relapse] === relapse complete ===");
-        await log("[relapse] elfldr listening on :9021" + (exploit.crossed
+        log_now("=== relapse complete ===");
+        log_now("elfldr listening on :9021" + (exploit.crossed
             ? " - the crossed pair is STILL ARMED: send the pipeclean seal ELF to " +
             ":9021 BEFORE closing the app, closing while armed panics the console"
-            : " (pipes and sysctl OIDs torn down, eboot segments restored)"));
+            : " - both pipes hold their own buffers again, the app is safe to close" +
+            (exploit.oidsRestored ? "" :
+                "; the sysctl OIDs are still hijacked, so kern.smp.cpus reads a " +
+                "kernel address instead of the CPU count until the next reboot") +
+            " (eboot segments restored)"));
         send_notification("relapse complete\nelfldr on <ps5-ip>:9021");
         if (EXIT_TEST === "sigkill" || EXIT_TEST === "exit") {
             const pid = syscall(SYSCALL.getpid);
