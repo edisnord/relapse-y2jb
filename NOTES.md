@@ -46,8 +46,8 @@ release ships differently named files, that is the first thing to check.
 **Loader size.** The Y2JB remote JS loader reads at most `0x40000` (256 KiB).
 A larger payload arrives truncated and the console reports
 `SyntaxError: Unexpected end of input`, which looks like a bug in your edit and
-is not. `relapse.js` is ~254 KB, leaving under 2 KB of headroom — the reason several
-diagnostic methods are emitted only under `--diag`.
+is not. `relapse.js` is ~254 KB, leaving under 2 KB of headroom, which is why the
+diagnostic code listed near the end of this file is not in it.
 
 ## Logging
 
@@ -73,8 +73,8 @@ a panic, so the marker is deliberate. It is cleared automatically when a run
 stops cleanly without jailbreaking — including when the payload refuses because
 the process is already jailbroken.
 
-If you are experimenting and know the kernel is clean, the check can be
-overridden at build time (`--set IGNORE_FAIL_MARKER=true`).
+The check is a file-existence test, so if you know the kernel is clean, deleting
+that file clears it.
 
 ## Closing the app
 
@@ -129,8 +129,8 @@ own kernel read/write has neither constraint, which is why the seal is a payload
 ### A mitigation that was removed
 
 Earlier revisions held the four pipe files at `f_count = 0x10000` so `pipe_dtor()`
-could not run at all. That is gone: `holdPipeFiles()` is not emitted into the
-production payload and the build rejects the flags that call it without `--diag`.
+could not run at all. That is gone: `holdPipeFiles()` is not in the shipped
+payload and nothing there calls it.
 Once the buffers are real, `pipe_dtor()` is harmless, and all the hold does is leak
 four `struct file` objects past process exit, which the teardown still has to
 account for. A full production run with the hold died four seconds after exit; the
@@ -161,47 +161,32 @@ takes about three seconds. Suspending the console is not an alternative — noth
 executes while suspended, so `:9021` will not answer and a saved state has nothing
 to resume into.
 
-## Debug build
+## What is not in the shipped payload
 
-The release payload has all forensics switched off. A debug build adds:
+`relapse.js` is generated, with the comments stripped out; that is what keeps it
+under the loader's size limit. It carries no diagnostic code, for two reasons —
+there is barely room for any, and some of it is fatal.
 
-* a snapshot of the process's kernel-visible state immediately before and after
-  the handoff — `p_ucred` and its fields, every `f_cred`, every `td_ucred`, the
-  filedesc table, the dynlib syscall range, both pipe buffers — so the diff
-  shows exactly what the `kexp` blob changed. Every pointer is range-checked
-  before it is dereferenced. (This is how the blob's fd-table swap was found:
-  256 entries at a heap address became 768 entries in a different region.)
-* a read-only dump of the reclaimed aio waiter arrays, taken while the group
-  still points at them, logged next to `kbase` and the `nodeMutex` address the
-  offset table implies.
-* `dlsym` probing, and the p2jb-style `f_cred`/`td_ucred` migration — the only
-  two that write.
+Not included:
 
-There are also bisect switches that stop the run at a stage boundary
-(`chain`, `arm`, `locate`, `fast`, `defuse`, `escalate`), skip the handoff
-entirely, and close the pipe fds from the payload instead of leaving them to
-process exit. `rescue()` still runs on the way out of every one, so each rung is
-self-cleaning. `arm` stops before the pipes are created and `locate` after they
-exist but before they are crossed.
+* a snapshot of the process's kernel-visible state immediately before and after the
+  handoff — `p_ucred` and its fields, every `f_cred`, every `td_ucred`, the filedesc
+  table, the dynlib syscall range, both pipe buffers — whose diff shows what the
+  `kexp` blob changed. That diff is how the blob's fd-table swap was found: 256
+  entries at a heap address became 768 entries in a different region.
+* a read-only dump of the reclaimed aio waiter arrays, taken while the group still
+  points at them.
+* `dlsym` probing, and the p2jb-style `f_cred`/`td_ucred` migration.
+* `holdPipeFiles()`, which is fatal — see
+  [A mitigation that was removed](#a-mitigation-that-was-removed).
+* the bisect rungs that stop a run at a stage boundary (`chain`, `arm`, `locate`,
+  `fast`, `defuse`, `escalate`), skip the handoff entirely, or close the pipe
+  descriptors from the payload instead of leaving them to process exit. `arm` stops
+  before the pipes are created and `locate` after they exist but before they are
+  crossed.
 
-`--diag` also puts back `holdPipeFiles()` and the flags that call it, neither of
-which is in the production payload.
-
-## Source
-
-`relapse.js` is generated. The readable source, the offset tables, the build
-system and a fake-host smoke test that runs the payload end to end live in the
-`Relapse-Y2JB-Porting` repository, which builds against a checkout of
-[upstream Relapse](https://github.com/ntfargo/Relapse-Exploit):
-
-```bash
-node tools/build.mjs                                  # -> relapse.js
-node tools/build.mjs --set DIAGNOSE_AFTER_HANDOFF=true --out relapse-debug.js
-node tools/hostcheck.mjs 12.60                        # runs it against a fake host
-```
-
-Comments live in `src/relapse.template.js` and are stripped from the build,
-which is what keeps the payload under the loader's size limit.
+What the shipped payload does log is under [Logging](#logging): roughly thirty lines
+per run, mirrored to UDP 5050.
 
 ## Credits
 
@@ -223,9 +208,6 @@ shellcode this port hands the kernel to. `elfldr` arrives bundled with Y2JB and
 is credited in its README.
 
 **[Luac0re / p2jb](https://github.com/Gezine/Luac0re)** and
-**[P2JB-Y2JB-Porting](https://github.com/matem6/P2JB-Y2JB-Porting)** — the
-`fhold`/`eboot` preparation, the one-run-per-boot marker discipline and the
-post-jailbreak cred migration in the debug build all come from that port's
-close-panic work, as does the observation that a jailbroken host process cannot
-be closed. Its README credits the contributors behind that investigation,
-including the people who ran its hardware test builds.
+**[P2JB-Y2JB-Porting](https://github.com/matem6/P2JB-Y2JB-Porting)** — the `eboot`
+segment preparation, the one-run-per-boot marker discipline, and the post-jailbreak
+cred handling.
