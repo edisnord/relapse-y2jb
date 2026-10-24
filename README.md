@@ -45,6 +45,28 @@ nc <ps5-ip> 9021 < payload.elf
 The jailbreak takes about three seconds. Progress is printed to the sender and
 mirrored to UDP port 5050 on your machine.
 
+Run the listener before sending the payload:
+```bash
+python tools/log_listener.py --output capture.log
+```
+Run the listener on the same PC as the `payload_sender.py` or `nc` process. The
+payload's default UDP logger learns the PC address from that TCP connection and
+sends the mirror to port 5050. A console-side loading path may appear as
+loopback and disable the UDP mirror. The listener writes datagram bytes
+unchanged; stop it with Ctrl+C.
+Without `--output`, it creates a unique timestamped filename. The listener
+stores no sender addresses and never overwrites an existing file. Keep the
+console and PC on the same reachable network; if no logs arrive on Windows,
+allow Python to receive inbound UDP on port 5050 for the Private network
+profile. Send payloads to the PS5 address as usual; the listener receives the
+console's log mirror on the PC.
+
+Summarize a saved capture with:
+```bash
+python tools/analyze_udp_log.py capture.log
+python tools/analyze_udp_log.py capture.log --json
+```
+
 ## Closing the app
 
 Just close it. The payload puts both pipes back the way it found them before it
